@@ -1,7 +1,9 @@
 openai>=1.0.0
 httpx
-aiohttp
 python-dotenv
+aiohttp
 aiohttp-cors
-Pillow
 numpy
+Pillow
+fer
+tensorflow
