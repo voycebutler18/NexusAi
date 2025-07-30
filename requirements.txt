@@ -1,10 +1,24 @@
+# --- CORE AI ---
 openai>=1.0.0
-httpx
 python-dotenv
+
+# --- WEB + ASYNC ---
 aiohttp
 aiohttp-cors
-numpy
+httpx
+websockets
+
+# --- SERVER-SIDE AUDIO PROCESSING ---
+gTTS
+speechrecognition
+
+# --- VISION + CAMERA ---
+opencv-python
 Pillow
-fer
+numpy
+
+# --- EMOTION RECOGNITION ---
 tensorflow
+fer
 moviepy
+flask
