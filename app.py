@@ -395,12 +395,12 @@
                 utterance.onend = () => {
                     isAISpeaking = false;
                     
-                    // 500ms delay before resuming listening (as requested)
+                    # 500ms delay before resuming listening (as requested)
                     setTimeout(() => {
                         speechDetectionActive = true;
                         updateCosmicState('listening', 'COSMIC NEURAL MATRIX ACTIVE...');
                         
-                        // Notify server that speaking is done
+                        # Notify server that speaking is done
                         if (ws && ws.readyState === WebSocket.OPEN) {
                             ws.send(JSON.stringify({
                                 type: 'status',
