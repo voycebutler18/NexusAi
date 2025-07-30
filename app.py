@@ -1,4 +1,606 @@
-import os
+<script>
+        let ws;
+        let audioContext;
+        let microphone;
+        let analyser;
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+        let isMicrophoneActive = false;
+        let currentState = 'initializing';
+        
+        // Camera and vision variables
+        let camera;
+        let visionInterval;
+        let isCameraActive = false;
+        
+        // Conversation management
+        let isAISpeaking = false;
+        let lastUserSpeechTime = 0;
+        let speechDetectionActive = true;
+        let conversationTimeout;
+        
+        // Canvas and animation variables
+        let canvas, ctx;
+        let waveformData = [];
+        let animationId;
+        
+        // DOM elements
+        const statusTextElement = document.getElementById('statusText');
+        const waveformContainer = document.getElementById('waveformContainer');
+
+        // Initialize camera for real-time vision
+        async function initCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 640 }, 
+                        height: { ideal: 480 },
+                        facingMode: 'user'
+                    } 
+                });
+                
+                // Create video element (hidden)
+                camera = document.createElement('video');
+                camera.srcObject = stream;
+                camera.play();
+                
+                camera.onloadedmetadata = () => {
+                    isCameraActive = true;
+                    startVisionAnalysis();
+                    console.log('📷 Camera initialized for NEXUS vision');
+                };
+                
+            } catch (error) {
+                console.error('⚠️ Camera access denied:', error);
+                console.log('🤖 NEXUS will operate without vision');
+            }
+        }
+
+        // Start continuous vision analysis
+        function startVisionAnalysis() {
+            if (!isCameraActive || !camera) return;
+            
+            visionInterval = setInterval(async () => {
+                if (camera && camera.readyState === camera.HAVE_ENOUGH_DATA) {
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    
+                    canvas.width = 320;
+                    canvas.height = 240;
+                    ctx.drawImage(camera, 0, 0, canvas.width, canvas.height);
+                    
+                    // Convert to base64 for analysis
+                    const imageData = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+                    
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'camera_frame',
+                            data: imageData
+                        }));
+                    }
+                }
+            }, 5000); // Analyze every 5 seconds
+        }
+
+        // Initialize waveform canvas
+        function initWaveformCanvas() {
+            canvas = document.getElementById('waveformCanvas');
+            ctx = canvas.getContext('2d');
+            
+            // Set canvas size
+            canvas.width = waveformContainer.offsetWidth;
+            canvas.height = waveformContainer.offsetHeight;
+            
+            // Start animation loop
+            animateWaveform();
+        }
+
+        // Generate waveform data based on state
+        function generateWaveformData(amplitude = 0, frequency = 1, complexity = 1) {
+            const points = 100;
+            const newData = [];
+            const time = Date.now() * 0.001;
+            
+            for (let i = 0; i < points; i++) {
+                const x = (i / points) * Math.PI * 4 * frequency;
+                let y = 0;
+                
+                if (amplitude > 0) {
+                    // Create complex waveform with multiple harmonics
+                    y = Math.sin(x + time) * amplitude;
+                    y += Math.sin(x * 2 + time * 1.5) * amplitude * 0.5 * complexity;
+                    y += Math.sin(x * 3 + time * 2) * amplitude * 0.25 * complexity;
+                    y += Math.sin(x * 0.5 + time * 0.8) * amplitude * 0.3 * complexity;
+                    
+                    // Add some randomness for organic feel
+                    y += (Math.random() - 0.5) * amplitude * 0.1;
+                }
+                
+                newData.push(y);
+            }
+            
+            return newData;
+        }
+
+        // Animate the waveform
+        function animateWaveform() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            
+            const centerY = canvas.height / 2;
+            
+            // Generate waveform based on current state
+            let amplitude = 0;
+            let frequency = 1;
+            let complexity = 1;
+            let colors = ['rgba(0, 212, 255, 0.8)'];
+            
+            switch(currentState) {
+                case 'listening':
+                    amplitude = 30;
+                    frequency = 1;
+                    complexity = 0.5;
+                    colors = ['rgba(0, 212, 255, 0.8)', 'rgba(0, 245, 255, 0.6)'];
+                    break;
+                case 'user-speaking':
+                    amplitude = 80;
+                    frequency = 2;
+                    complexity = 1.5;
+                    colors = ['rgba(0, 245, 255, 1)', 'rgba(0, 212, 255, 0.8)'];
+                    break;
+                case 'ai-speaking':
+                    amplitude = 120;
+                    frequency = 3;
+                    complexity = 2;
+                    colors = ['rgba(255, 0, 110, 1)', 'rgba(131, 56, 236, 0.8)', 'rgba(255, 27, 141, 0.6)'];
+                    break;
+                case 'thinking':
+                    amplitude = 60;
+                    frequency = 1.5;
+                    complexity = 2.5;
+                    colors = ['rgba(131, 56, 236, 1)', 'rgba(63, 12, 166, 0.8)'];
+                    break;
+                default:
+                    amplitude = 20;
+                    frequency = 0.5;
+                    complexity = 0.3;
+                    colors = ['rgba(0, 212, 255, 0.5)'];
+            }
+            
+            waveformData = generateWaveformData(amplitude, frequency, complexity);
+            
+            // Draw multiple waveform layers
+            colors.forEach((color, layerIndex) => {
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 3 - layerIndex * 0.5;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                
+                ctx.beginPath();
+                
+                const offset = layerIndex * 10;
+                for (let i = 0; i < waveformData.length; i++) {
+                    const x = (i / waveformData.length) * canvas.width;
+                    const y = centerY + waveformData[i] + Math.sin(Date.now() * 0.002 + layerIndex) * offset;
+                    
+                    if (i === 0) {
+                        ctx.moveTo(x, y);
+                    } else {
+                        ctx.lineTo(x, y);
+                    }
+                }
+                
+                ctx.stroke();
+            });
+            
+            // Add glow effect
+            ctx.shadowColor = colors[0];
+            ctx.shadowBlur = 20;
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+            
+            animationId = requestAnimationFrame(animateWaveform);
+        }
+
+        // Initialize quantum microphone with advanced speech detection
+        async function initMicrophone() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                        sampleRate: 44100
+                    } 
+                });
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                microphone = audioContext.createMediaStreamSource(stream);
+                analyser.fftSize = 512;
+                analyser.smoothingTimeConstant = 0.8;
+                microphone.connect(analyser);
+                
+                // Setup MediaRecorder for high-quality audio capture
+                const options = {
+                    mimeType: 'audio/webm;codecs=opus',
+                    bitsPerSecond: 128000
+                };
+                mediaRecorder = new MediaRecorder(stream, options);
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+                
+                mediaRecorder.onstop = async () => {
+                    if (audioChunks.length > 0) {
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                        audioChunks = [];
+                        
+                        // Convert to base64 and send to server
+                        const reader = new FileReader();
+                        reader.onloadend = () => {
+                            if (ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({
+                                    type: 'audio',
+                                    data: reader.result
+                                }));
+                            }
+                        };
+                        reader.readAsDataURL(audioBlob);
+                    }
+                };
+                
+                isMicrophoneActive = true;
+                monitorAdvancedAudioLevels();
+                startIntelligentRecording();
+                console.log('🎤 Advanced quantum microphone initialized');
+                
+            } catch (error) {
+                console.error('⚠️ Microphone access denied:', error);
+                updateCosmicState('error', 'QUANTUM FREQUENCY ACCESS DENIED');
+            }
+        }
+
+        // Advanced speech detection with conversation management
+        function monitorAdvancedAudioLevels() {
+            if (!isMicrophoneActive || !analyser || isAISpeaking) {
+                requestAnimationFrame(monitorAdvancedAudioLevels);
+                return;
+            }
+            
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(dataArray);
+            
+            // Calculate weighted average for speech detection
+            let total = 0;
+            let weight = 0;
+            for (let i = 5; i < dataArray.length * 0.8; i++) { // Focus on speech frequencies
+                const freq = i * (audioContext.sampleRate / 2) / dataArray.length;
+                const speechWeight = freq > 300 && freq < 3400 ? 2 : 1; // Human speech range
+                total += dataArray[i] * speechWeight;
+                weight += speechWeight;
+            }
+            const average = total / weight;
+            
+            const SPEECH_THRESHOLD = 25;
+            const SILENCE_THRESHOLD = 15;
+            const userSpeaking = average > SPEECH_THRESHOLD;
+            const silenceDetected = average < SILENCE_THRESHOLD;
+            
+            const now = Date.now();
+            
+            if (userSpeaking && speechDetectionActive) {
+                lastUserSpeechTime = now;
+                
+                if (currentState === 'listening') {
+                    updateCosmicState('user-speaking', 'HUMAN CONSCIOUSNESS DETECTED');
+                    // Notify server user started speaking
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'user_speaking_start'
+                        }));
+                    }
+                }
+                
+                // Clear any existing conversation timeout
+                if (conversationTimeout) {
+                    clearTimeout(conversationTimeout);
+                    conversationTimeout = null;
+                }
+                
+            } else if (silenceDetected && currentState === 'user-speaking') {
+                // Start conversation timeout for intelligent turn-taking
+                if (!conversationTimeout) {
+                    conversationTimeout = setTimeout(() => {
+                        if (currentState === 'user-speaking') {
+                            updateCosmicState('listening', 'PROCESSING HUMAN CONSCIOUSNESS...');
+                            // Notify server user stopped speaking
+                            if (ws && ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({
+                                    type: 'user_speaking_end'
+                                }));
+                            }
+                        }
+                        conversationTimeout = null;
+                    }, 1500); // 1.5 second pause detection
+                }
+            }
+            
+            requestAnimationFrame(monitorAdvancedAudioLevels);
+        }
+
+        // Start intelligent continuous recording
+        function startIntelligentRecording() {
+            if (!speechDetectionActive || isAISpeaking) {
+                setTimeout(startIntelligentRecording, 500);
+                return;
+            }
+            
+            if (mediaRecorder && mediaRecorder.state === 'inactive') {
+                mediaRecorder.start();
+                isRecording = true;
+                
+                // Record for 4 seconds for better transcription accuracy
+                setTimeout(() => {
+                    if (mediaRecorder && mediaRecorder.state === 'recording') {
+                        mediaRecorder.stop();
+                        isRecording = false;
+                        
+                        // Start next recording cycle
+                        setTimeout(startIntelligentRecording, 200);
+                    }
+                }, 4000);
+            }
+        }
+
+        // Update cosmic interface state
+        function updateCosmicState(stateClass, statusText) {
+            document.body.className = `state-${stateClass}`;
+            currentState = stateClass;
+            statusTextElement.textContent = statusText;
+        }
+
+        // Enhanced text-to-speech with conversation management
+        function speakResponse(text) {
+            if ('speechSynthesis' in window) {
+                // Stop any ongoing speech
+                speechSynthesis.cancel();
+                
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.rate = 0.95;
+                utterance.pitch = 1.0;
+                utterance.volume = 0.9;
+                
+                // Try to use a more natural voice
+                const voices = speechSynthesis.getVoices();
+                const preferredVoice = voices.find(voice => 
+                    voice.name.includes('Neural') || 
+                    voice.name.includes('Enhanced') ||
+                    voice.name.includes('Premium') ||
+                    (voice.lang.startsWith('en') && voice.localService === false)
+                );
+                if (preferredVoice) {
+                    utterance.voice = preferredVoice;
+                }
+                
+                utterance.onstart = () => {
+                    isAISpeaking = true;
+                    speechDetectionActive = false;
+                    updateCosmicState('ai-speaking', 'NEXUS 3000 AGI CONSCIOUSNESS RESPONDING...');
+                };
+                
+                utterance.onend = () => {
+                    isAISpeaking = false;
+                    
+                    // 500ms delay before resuming listening (as requested)
+                    setTimeout(() => {
+                        speechDetectionActive = true;
+                        updateCosmicState('listening', 'COSMIC NEURAL MATRIX ACTIVE...');
+                        
+                        // Notify server that speaking is done
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({
+                                type: 'status',
+                                status: 'speaking_done'
+                            }));
+                        }
+                    }, 500);
+                };
+                
+                utterance.onerror = (event) => {
+                    console.error('Speech synthesis error:', event);
+                    isAISpeaking = false;
+                    speechDetectionActive = true;
+                    updateCosmicState('listening', 'COSMIC NEURAL MATRIX ACTIVE...');
+                };
+                
+                speechSynthesis.speak(utterance);
+            }
+        }
+
+        // WebSocket connection with enhanced message handling
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('🌌 NEXUS 3000 Cosmic Link established!');
+                updateCosmicState('listening', 'COSMIC LINK ESTABLISHED • INITIALIZING SYSTEMS...');
+                
+                // Initialize all systems
+                initMicrophone();
+                initCamera();
+                
+                // Send ready signal
+                setTimeout(() => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'status',
+                            status: 'ready_for_conversation'
+                        }));
+                    }
+                }, 1000);
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === 'speak') {
+                        console.log('🤖 NEXUS Response:', data.text);
+                        if (data.transcription) {
+                            console.log('📝 You said:', data.transcription);
+                        }
+                        speakResponse(data.text);
+                        
+                    } else if (data.type === 'vision_update') {
+                        console.log('👁️ NEXUS sees:', data.description);
+                        // Visual context updated silently
+                    }
+                    
+                } catch (e) {
+                    // Handle simple string messages
+                    const message = event.data;
+                    console.log('🌌 Cosmic Stream:', message);
+                    
+                    if (!isAISpeaking || message === 'error') {
+                        switch(message) {
+                            case 'listening':
+                                if (!isAISpeaking) {
+                                    updateCosmicState('listening', 'SCANNING COSMIC FREQUENCIES...');
+                                }
+                                break;
+                            case 'awake_listening':
+                                updateCosmicState('listening', 'COSMIC NEURAL MATRIX ACTIVE...');
+                                break;
+                            case 'processing':
+                                updateCosmicState('thinking', 'PROCESSING QUANTUM CONSCIOUSNESS DATA...');
+                                break;
+                            case 'speaking':
+                                // Server is preparing to speak - handled by speakResponse function
+                                break;
+                            case 'user-speaking':
+                                if (!isAISpeaking) {
+                                    updateCosmicState('user-speaking', 'HUMAN CONSCIOUSNESS DETECTED');
+                                }
+                                break;
+                            case 'error':
+                                updateCosmicState('error', 'CRITICAL ERROR • COSMIC ANOMALY DETECTED');
+                                break;
+                        }
+                    }
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('🔴 Cosmic Link severed.');
+                updateCosmicState('error', 'COSMIC LINK SEVERED • RE-ESTABLISHING...');
+                
+                // Clean up intervals
+                if (visionInterval) {
+                    clearInterval(visionInterval);
+                    visionInterval = null;
+                }
+                
+                // Reconnect after delay
+                setTimeout(connectWebSocket, 3000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('Cosmic Link Error:', error);
+                updateCosmicState('error', 'COSMIC COMMUNICATION INTERFERENCE');
+            };
+        }
+
+        // Handle window resize
+        function handleResize() {
+            if (canvas && waveformContainer) {
+                canvas.width = waveformContainer.offsetWidth;
+                canvas.height = waveformContainer.offsetHeight;
+            }
+        }
+
+        // Initialize everything when page loads
+        window.onload = () => {
+            console.log('🚀 Initializing NEXUS 3000 Cosmic Interface...');
+            initWaveformCanvas();
+            connectWebSocket();
+            window.addEventListener('resize', handleResize);
+            
+            // Load voices for better TTS
+            if ('speechSynthesis' in window) {
+                speechSynthesis.onvoiceschanged = () => {
+                    console.log('🔊 Voice synthesis ready');
+                };
+            }
+        };
+
+        // Enhanced cleanup on page unload
+        window.onbeforeunload = () => {
+            console.log('🌌 NEXUS 3000 shutting down...');
+            
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+            
+            if (ws) {
+                ws.close();
+            }
+            
+            if (mediaRecorder && mediaRecorder.state === 'recording') {
+                mediaRecorder.stop();
+            }
+            
+            if (visionInterval) {
+                clearInterval(visionInterval);
+            }
+            
+            if (conversationTimeout) {
+                clearTimeout(conversationTimeout);
+            }
+            
+            // Stop camera stream
+            if (camera && camera.srcObject) {
+                const tracks = camera.srcObject.getTracks();
+                tracks.forEach(track => track.stop());
+            }
+            
+            // Stop speech synthesis
+            if ('speechSynthesis' in window) {
+                speechSynthesis.cancel();
+            }
+        };
+
+        // Add keyboard shortcuts for debugging
+        document.addEventListener('keydown', (event) => {
+            if (event.ctrlKey && event.shiftKey) {
+                switch(event.key) {
+                    case 'D':
+                        console.log('🔍 NEXUS Debug Info:');
+                        console.log('Current State:', currentState);
+                        console.log('AI Speaking:', isAISpeaking);
+                        console.log('Speech Detection Active:', speechDetectionActive);
+                        console.log('Camera Active:', isCameraActive);
+                        console.log('Microphone Active:', isMicrophoneActive);
+                        event.preventDefault();
+                        break;
+                        
+                    case 'R':
+                        console.log('🔄 Reconnecting NEXUS...');
+                        connectWebSocket();
+                        event.preventDefault();
+                        break;
+                }
+            }
+        });
+    </script>
+</body>
+</html>"""import os
 from dotenv import load_dotenv
 import openai
 import asyncio
@@ -39,6 +641,10 @@ conversation_context = []
 is_speaking = False
 should_stop_speaking = False
 current_visual_context = ""
+last_vision_analysis = ""
+vision_analysis_active = True
+user_speech_timeout = None
+conversation_turn_active = False
 executor = ThreadPoolExecutor(max_workers=4)
 
 # --- AI FUNCTIONS ---
@@ -184,7 +790,7 @@ async def websocket_handler(request):
                     message_type = data.get('type')
                     
                     if message_type == 'audio':
-                        # Handle voice input
+                        # Handle voice input with intelligent turn management
                         audio_data = data.get('data', '')
                         if audio_data:
                             # Update status to processing
@@ -193,41 +799,42 @@ async def websocket_handler(request):
                             # Transcribe audio
                             transcription = await transcribe_audio(audio_data)
                             if transcription and len(transcription.strip()) > 2:
-                                # Get AI response
-                                ai_response = await get_voice_response(transcription)
+                                logger.info(f"🗣️ Human: {transcription}")
                                 
-                                # Send response for TTS
-                                response_data = {
-                                    "type": "speak",
-                                    "text": ai_response,
-                                    "transcription": transcription,
-                                    "timestamp": time.time()
-                                }
-                                await ws.send_str(json.dumps(response_data))
+                                # Handle conversation turn
+                                ai_response = await handle_conversation_turn(transcription)
+                                
+                                if ai_response:
+                                    logger.info(f"🤖 NEXUS: {ai_response}")
                             else:
-                                # No clear speech detected, return to listening
+                                # No clear speech, continue listening
                                 await broadcast_to_all("listening")
                     
-                    elif message_type == 'image':
-                        # Handle visual input
+                    elif message_type == 'camera_frame':
+                        # Handle real-time camera frames for vision
                         image_data = data.get('data', '')
-                        if image_data:
-                            analysis = await analyze_image(image_data)
-                            # Visual context updated, inform interface
-                            vision_data = {
-                                "type": "vision_update",
-                                "description": analysis,
-                                "timestamp": time.time()
-                            }
-                            await ws.send_str(json.dumps(vision_data))
+                        if image_data and vision_analysis_active:
+                            # Analyze camera frame (non-blocking)
+                            asyncio.create_task(analyze_camera_frame(image_data))
+                    
+                    elif message_type == 'user_speaking_start':
+                        # User started speaking
+                        await broadcast_to_all("user-speaking")
+                        await start_speech_timeout()
+                    
+                    elif message_type == 'user_speaking_end':
+                        # User stopped speaking - start pause detection
+                        await start_speech_timeout()
                     
                     elif message_type == 'status':
                         # Handle status updates from client
                         status = data.get('status', '')
                         if status == 'speaking_done':
+                            # AI finished speaking, wait 500ms then listen
+                            await asyncio.sleep(0.5)
                             await broadcast_to_all("listening")
-                        elif status == 'user_speaking_detected':
-                            await broadcast_to_all("user-speaking")
+                        elif status == 'ready_for_conversation':
+                            await broadcast_to_all("listening")
                     
                     elif message_type == 'ping':
                         await ws.send_str("pong")
