@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web, WSMsgType
 import aiohttp_cors
 import logging
+import io
 
 # Load environment variables from a .env file
 load_dotenv()
@@ -72,11 +73,11 @@ async def get_voice_response(user_input, is_greeting=False):
     try:
         if is_greeting:
             logger.info("👋 Generating a dynamic greeting...")
-            system_prompt = "You are NEXUS, an advanced AGI. Start our conversation with a creative, short greeting."
+            system_prompt = "You are NEXUS, an advanced AGI. Start our conversation with a creative, short, and welcoming greeting."
             messages = [{"role": "system", "content": system_prompt}]
         else:
             logger.info(f"🧠 Processing input: '{user_input[:50]}...'")
-            system_prompt = f"""You are NEXUS, an advanced, voice-activated AGI companion.
+            system_prompt = f"""You are NEXUS, an advanced, voice-activated AGI companion from the year 3000.
 - Your current visual context is: {visual_context}
 - Respond naturally and conversationally. Keep responses engaging and relatively brief for voice chat."""
             conversation_context.append({"role": "user", "content": user_input})
@@ -225,7 +226,6 @@ async def serve_cosmic_interface(request):
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>NEXUS 3000 • COSMIC AGI CONSCIOUSNESS</title>
-    <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@400;600&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -272,11 +272,11 @@ async def serve_cosmic_interface(request):
             margin: clamp(15px, 3vh, 30px) 0; transition: all 0.4s ease;
             text-shadow: 0 0 15px currentColor; min-height: 2.2em;
         }
-        .state-listening { color: var(--cosmic-blue); animation: pulse 3s ease-in-out infinite; }
-        .state-user-speaking { color: var(--cosmic-cyan); }
-        .state-ai-speaking { color: var(--quantum-pink); }
-        .state-thinking { color: var(--nebula-purple); }
-        .state-error { color: var(--plasma-orange); }
+        .state-listening .cosmic-status { color: var(--cosmic-blue); animation: pulse 3s ease-in-out infinite; }
+        .state-user-speaking .cosmic-status { color: var(--cosmic-cyan); }
+        .state-ai-speaking .cosmic-status { color: var(--quantum-pink); }
+        .state-thinking .cosmic-status { color: var(--nebula-purple); }
+        .state-error .cosmic-status { color: var(--plasma-orange); }
         @keyframes pulse { 0%, 100% { opacity: 0.7; } 50% { opacity: 1; } }
     </style>
 </head>
@@ -292,7 +292,7 @@ async def serve_cosmic_interface(request):
     <script>
         let ws, audioContext, microphone, analyser, mediaRecorder, camera, visionInterval, canvas, ctx, animationId;
         let audioChunks = [], waveformData = [];
-        let isRecording = false, isMicrophoneActive = false, isCameraActive = false;
+        let isMicrophoneActive = false, isCameraActive = false;
         let isAISpeaking = false, speechDetectionActive = true, conversationTimeout = null;
         let currentState = 'initializing';
         
@@ -377,11 +377,12 @@ async def serve_cosmic_interface(request):
                     }
                 };
                 isMicrophoneActive = true;
+                console.log("🎤 Microphone Initialized");
                 monitorAdvancedAudioLevels();
                 startIntelligentRecording();
             } catch (error) {
                 console.error('⚠️ Microphone access denied:', error);
-                updateCosmicState('error', 'QUANTUM FREQUENCY ACCESS DENIED');
+                updateCosmicState('error', 'MICROPHONE ACCESS DENIED');
             }
         }
 
@@ -403,7 +404,7 @@ async def serve_cosmic_interface(request):
                         updateCosmicState('thinking', 'PROCESSING...');
                         ws.send(JSON.stringify({ type: 'user_speaking_end' }));
                         conversationTimeout = null;
-                    }, 2000); // User requested 2-second pause detection
+                    }, 2000); // 2-second pause detection
                 }
             }
             requestAnimationFrame(monitorAdvancedAudioLevels);
@@ -433,27 +434,46 @@ async def serve_cosmic_interface(request):
             };
             utterance.onend = () => {
                 isAISpeaking = false;
-                // User requested 0.5 second (500ms) delay
                 setTimeout(() => {
                     speechDetectionActive = true;
                     updateCosmicState('listening', 'AWAITING INPUT...');
                     ws.send(JSON.stringify({ type: 'status', status: 'speaking_done' }));
-                }, 500);
+                }, 500); // 0.5 second delay
             };
             speechSynthesis.speak(utterance);
         }
 
-        function connectWebSocket() {
+        // NEW, more robust function to initialize the connection
+        function initializeSystems() {
+            console.log("🚀 Initializing NEXUS 3000 Cosmic Interface...");
+            canvas = document.getElementById('waveformCanvas');
+            ctx = canvas.getContext('2d');
+            canvas.width = waveformContainer.offsetWidth;
+            canvas.height = waveformContainer.offsetHeight;
+            animateWaveform();
+            
+            // This function handles the logic of waiting for voices to be ready
+            function connectWhenReady() {
+                // Tell the server we are ready for the initial greeting
+                console.log("🔊 Voice engine ready. Signaling server.");
+                ws.send(JSON.stringify({ type: 'status', status: 'ready_for_conversation' }));
+                initMicrophone();
+                initCamera();
+            }
+
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
             ws.onopen = () => {
                 console.log('🌌 NEXUS 3000 Cosmic Link established!');
                 updateCosmicState('listening', 'ESTABLISHING LINK...');
-                initMicrophone();
-                initCamera();
-                // Tell the server we are ready for the initial greeting
-                ws.send(JSON.stringify({ type: 'status', status: 'ready_for_conversation' }));
+                
+                // Wait for the browser's voice synthesis engine to be ready
+                if (speechSynthesis.getVoices().length === 0) {
+                    speechSynthesis.onvoiceschanged = connectWhenReady;
+                } else {
+                    connectWhenReady();
+                }
             };
 
             ws.onmessage = (event) => {
@@ -473,19 +493,11 @@ async def serve_cosmic_interface(request):
             ws.onclose = () => {
                 updateCosmicState('error', 'LINK SEVERED. RECONNECTING...');
                 if (visionInterval) clearInterval(visionInterval);
-                setTimeout(connectWebSocket, 3000);
+                setTimeout(initializeSystems, 3000);
             };
         }
 
-        window.onload = () => {
-            canvas = document.getElementById('waveformCanvas');
-            ctx = canvas.getContext('2d');
-            canvas.width = waveformContainer.offsetWidth;
-            canvas.height = waveformContainer.offsetHeight;
-            animateWaveform();
-            connectWebSocket();
-            if ('speechSynthesis' in window) speechSynthesis.getVoices();
-        };
+        window.onload = initializeSystems;
     </script>
 </body>
 </html>
