@@ -10,15 +10,21 @@ websockets
 
 # --- SERVER-SIDE AUDIO PROCESSING ---
 gTTS
-speechrecognition
+SpeechRecognition
 
 # --- VISION + CAMERA ---
-opencv-python
+opencv-python-headless
 Pillow
 numpy
 
 # --- EMOTION RECOGNITION ---
-tensorflow
-fer
-moviepy
-flask
+tensorflow>=2.8.0
+fer>=22.4.0
+moviepy>=1.0.3
+
+# --- ADDITIONAL DEPENDENCIES FOR FER ---
+imageio
+imageio-ffmpeg
+
+# --- REMOVE FLASK (not needed for aiohttp app) ---
+# flask
