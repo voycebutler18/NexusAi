@@ -1,0 +1,12 @@
+flask
+openai
+gtts
+playsound
+sounddevice
+wavio
+websockets
+opencv-python
+numpy
+Pillow
+speechrecognition
+pyaudio
