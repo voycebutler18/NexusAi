@@ -3,28 +3,24 @@ openai>=1.0.0
 python-dotenv
 
 # --- WEB + ASYNC ---
-aiohttp
+aiohttp>=3.8.0
 aiohttp-cors
-httpx
 websockets
 
 # --- SERVER-SIDE AUDIO PROCESSING ---
-gTTS
-SpeechRecognition
+gTTS>=2.3.0
+SpeechRecognition>=3.10.0
 
 # --- VISION + CAMERA ---
-opencv-python-headless
-Pillow
-numpy
+opencv-python-headless>=4.8.0
+Pillow>=9.5.0
+numpy>=1.24.0
 
-# --- EMOTION RECOGNITION ---
-tensorflow>=2.8.0
-fer>=22.4.0
-moviepy>=1.0.3
+# --- EMOTION RECOGNITION (OPTIONAL) ---
+tensorflow>=2.13.0
+fer>=22.5.2
 
-# --- ADDITIONAL DEPENDENCIES FOR FER ---
-imageio
-imageio-ffmpeg
-
-# --- REMOVE FLASK (not needed for aiohttp app) ---
-# flask
+# --- AUDIO PROCESSING DEPENDENCIES ---
+# Note: ffmpeg must be installed on the system
+# For Ubuntu/Debian: apt-get install ffmpeg
+# For Alpine: apk add ffmpeg
