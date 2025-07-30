@@ -1,26 +1,16 @@
-# --- CORE AI ---
 openai>=1.0.0
+httpx
 python-dotenv
-
-# --- WEB + ASYNC ---
-aiohttp>=3.8.0
+aiohttp
 aiohttp-cors
+numpy
+Pillow
+fer
+tensorflow
+sounddevice
+wavio
+gTTS
+playsound
+opencv-python
 websockets
-
-# --- SERVER-SIDE AUDIO PROCESSING ---
-gTTS>=2.3.0
-SpeechRecognition>=3.10.0
-
-# --- VISION + CAMERA ---
-opencv-python-headless>=4.8.0
-Pillow>=9.5.0
-numpy>=1.24.0
-
-# --- EMOTION RECOGNITION (OPTIONAL) ---
-tensorflow>=2.13.0
-fer>=22.5.2
-
-# --- AUDIO PROCESSING DEPENDENCIES ---
-# Note: ffmpeg must be installed on the system
-# For Ubuntu/Debian: apt-get install ffmpeg
-# For Alpine: apk add ffmpeg
+python-multipart
