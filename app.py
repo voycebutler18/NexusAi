@@ -1,7 +1,6 @@
 """
 NEXUS - AI-Powered Voice-Activated Camera-Aware Virtual Companion
-A real-time best friend experience that talks, listens, watches, and responds like a human.
-Deployed on Render for 24/7 cloud access.
+Deployment-ready version for Render - Your 24/7 AI Best Friend
 """
 
 import os
@@ -15,7 +14,6 @@ from aiohttp import web, WSMsgType
 import aiohttp_cors
 import logging
 import io
-import tempfile
 import speech_recognition as sr
 from gtts import gTTS
 import cv2
@@ -24,61 +22,37 @@ import re
 from datetime import datetime, timedelta
 import hashlib
 import uuid
-from typing import Dict, List, Optional, Tuple
-import gc
 
-# Try to import optional libraries with graceful fallbacks
-try:
-    import mediapipe as mp
-    import librosa
-    import soundfile as sf
-    from pydub import AudioSegment
-    HAS_ADVANCED_FEATURES = True
-except ImportError:
-    HAS_ADVANCED_FEATURES = False
-    logging.warning("Advanced features disabled due to missing dependencies")
-
-# --- RENDER DEPLOYMENT CONFIGURATION ---
+# --- RENDER CONFIGURATION ---
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Render-specific settings
+# Render environment
 PORT = int(os.getenv('PORT', 10000))
 HOST = '0.0.0.0'
-DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 
-# Use /tmp for ephemeral storage on Render
-BASE_DIR = "/tmp" if not DEBUG else "."
-MEMORY_FILE = os.path.join(BASE_DIR, "nexus_memory.json")
-CONVERSATION_FILE = os.path.join(BASE_DIR, "conversations.json")
-USER_PROFILES_FILE = os.path.join(BASE_DIR, "user_profiles.json")
+# Use /tmp for temporary files on Render
+MEMORY_FILE = "/tmp/nexus_memory.json"
+CONVERSATION_FILE = "/tmp/conversations.json"
 
-# NEXUS personality and behavior constants
+# NEXUS constants
 WAKE_WORDS = ["hey nexus", "nexus", "hey girl", "hey friend"]
-GOODBYE_PHRASES = ["goodbye nexus", "bye girl", "see you later", "goodnight", "talk to you later"]
-CONVERSATION_TIMEOUT = 300  # 5 minutes of silence before returning to wake word mode
+GOODBYE_PHRASES = ["goodbye nexus", "bye girl", "see you later", "goodnight"]
 
 # --- NEXUS CORE SYSTEMS ---
+
 class NEXUSMemory:
-    """Advanced memory system for NEXUS to remember conversations and users"""
+    """Memory system for NEXUS to remember conversations"""
     
     def __init__(self):
-        self.memories: Dict = {}
-        self.user_profiles: Dict = {}
-        self.conversation_history: List = []
-        self.load_all_data()
+        self.memories = {}
+        self.conversations = []
+        self.load_data()
     
-    def load_all_data(self):
-        """Load all persistent data"""
-        for file_path, attr_name in [
-            (MEMORY_FILE, 'memories'),
-            (USER_PROFILES_FILE, 'user_profiles'),
-            (CONVERSATION_FILE, 'conversation_history')
-        ]:
+    def load_data(self):
+        """Load persistent data"""
+        for file_path, attr_name in [(MEMORY_FILE, 'memories'), (CONVERSATION_FILE, 'conversations')]:
             try:
                 if os.path.exists(file_path):
                     with open(file_path, 'r') as f:
@@ -86,119 +60,95 @@ class NEXUSMemory:
                     logger.info(f"✅ Loaded {attr_name}: {len(getattr(self, attr_name))} entries")
             except Exception as e:
                 logger.error(f"⚠️ Could not load {attr_name}: {e}")
-                setattr(self, attr_name, {} if attr_name != 'conversation_history' else [])
+                setattr(self, attr_name, {} if attr_name == 'memories' else [])
     
-    def save_data(self, data_type: str):
-        """Save specific data type"""
-        file_map = {
-            'memories': MEMORY_FILE,
-            'user_profiles': USER_PROFILES_FILE,
-            'conversation_history': CONVERSATION_FILE
-        }
-        
+    def save_memories(self):
+        """Save memories to disk"""
         try:
-            file_path = file_map[data_type]
-            data = getattr(self, data_type)
-            with open(file_path, 'w') as f:
-                json.dump(data, f, indent=2)
+            with open(MEMORY_FILE, 'w') as f:
+                json.dump(self.memories, f, indent=2)
         except Exception as e:
-            logger.error(f"⚠️ Could not save {data_type}: {e}")
+            logger.error(f"⚠️ Could not save memories: {e}")
     
-    def store_memory(self, key: str, value: str, category: str = "general", user_id: str = "default"):
-        """Store a memory with context"""
-        memory_id = f"{user_id}_{key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self.memories[memory_id] = {
+    def save_conversations(self):
+        """Save conversations to disk"""
+        try:
+            # Keep only last 100 conversations to manage space
+            if len(self.conversations) > 100:
+                self.conversations = self.conversations[-100:]
+            
+            with open(CONVERSATION_FILE, 'w') as f:
+                json.dump(self.conversations, f, indent=2)
+        except Exception as e:
+            logger.error(f"⚠️ Could not save conversations: {e}")
+    
+    def store_memory(self, key, value, category="general"):
+        """Store a memory"""
+        self.memories[key] = {
             "value": value,
             "category": category,
-            "user_id": user_id,
             "timestamp": datetime.now().isoformat(),
-            "access_count": 0,
-            "importance_score": 1.0
+            "access_count": 0
         }
-        self.save_data('memories')
-        logger.info(f"💾 Stored memory: {key} = {value}")
+        self.save_memories()
+        logger.info(f"💾 Stored: {key} = {value}")
     
-    def recall_memories(self, query: str, user_id: str = "default", limit: int = 5) -> List:
-        """Intelligent memory recall"""
-        relevant_memories = []
+    def recall_memories(self, query, limit=3):
+        """Find relevant memories"""
+        relevant = []
         query_lower = query.lower()
         
-        for memory_id, memory in self.memories.items():
-            if memory["user_id"] != user_id:
-                continue
-                
+        for mem_id, memory in self.memories.items():
             score = 0
-            
-            # Text relevance
-            if query_lower in memory_id.lower():
+            if query_lower in mem_id.lower():
                 score += 3
             if query_lower in str(memory["value"]).lower():
                 score += 2
             
-            # Recency bonus
+            # Recent memories get higher score
             try:
                 timestamp = datetime.fromisoformat(memory["timestamp"])
                 hours_old = (datetime.now() - timestamp).total_seconds() / 3600
                 if hours_old < 24:
                     score += 2
-                elif hours_old < 168:  # 1 week
+                elif hours_old < 168:
                     score += 1
             except:
                 pass
             
-            # Importance and access frequency
-            score += memory.get("importance_score", 1.0)
-            score += min(memory.get("access_count", 0) * 0.1, 1.0)
-            
             if score > 0:
-                relevant_memories.append((memory_id, memory, score))
+                relevant.append((mem_id, memory, score))
         
-        # Sort by relevance and return top results
-        relevant_memories.sort(key=lambda x: x[2], reverse=True)
-        return relevant_memories[:limit]
+        relevant.sort(key=lambda x: x[2], reverse=True)
+        return relevant[:limit]
     
-    def add_conversation_turn(self, user_input: str, ai_response: str, context: Dict):
-        """Add a conversation turn to history"""
+    def add_conversation(self, user_input, ai_response, context):
+        """Add conversation turn"""
         turn = {
             "timestamp": datetime.now().isoformat(),
-            "user_input": user_input,
-            "ai_response": ai_response,
-            "context": context,
-            "session_id": context.get("session_id", "unknown")
+            "user": user_input,
+            "nexus": ai_response,
+            "context": context
         }
-        
-        self.conversation_history.append(turn)
-        
-        # Keep only last 1000 turns to manage memory
-        if len(self.conversation_history) > 1000:
-            self.conversation_history = self.conversation_history[-1000:]
-        
-        self.save_data('conversation_history')
+        self.conversations.append(turn)
+        self.save_conversations()
 
 
 class NEXUSVision:
-    """Computer vision system for camera awareness and emotion detection"""
+    """Basic computer vision for camera awareness"""
     
     def __init__(self):
         self.last_scene_hash = None
-        self.face_cascade = None
-        self.mp_face_detection = None
-        self.mp_face_mesh = None
-        
-        if HAS_ADVANCED_FEATURES:
-            try:
-                # Initialize MediaPipe for face detection
-                self.mp_face_detection = mp.solutions.face_detection
-                self.mp_face_mesh = mp.solutions.face_mesh
-                self.face_detection = self.mp_face_detection.FaceDetection(
-                    model_selection=0, min_detection_confidence=0.5
-                )
-                logger.info("✅ MediaPipe face detection initialized")
-            except Exception as e:
-                logger.error(f"⚠️ MediaPipe initialization failed: {e}")
+        # Load OpenCV face detector
+        try:
+            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            logger.info("✅ Face detection loaded")
+        except:
+            self.face_cascade = None
+            logger.warning("⚠️ Face detection not available")
     
-    async def analyze_frame(self, image_data: str) -> Dict:
-        """Analyze camera frame for people, emotions, and scene changes"""
+    def analyze_frame(self, image_data):
+        """Analyze camera frame"""
         try:
             # Decode image
             img_bytes = base64.b64decode(image_data)
@@ -217,12 +167,8 @@ class NEXUSVision:
             analysis = {
                 "scene_changed": scene_changed,
                 "timestamp": datetime.now().isoformat(),
-                "image_size": f"{img.shape[1]}x{img.shape[0]}",
-                "people_detected": 0,
-                "faces": [],
-                "dominant_colors": [],
-                "lighting": "unknown",
-                "movement_detected": scene_changed
+                "people_count": 0,
+                "lighting": "unknown"
             }
             
             # Basic lighting analysis
@@ -235,81 +181,43 @@ class NEXUSVision:
             else:
                 analysis["lighting"] = "normal"
             
-            # Face detection with MediaPipe (if available)
-            if HAS_ADVANCED_FEATURES and self.face_detection:
-                try:
-                    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    results = self.face_detection.process(rgb_img)
-                    
-                    if results.detections:
-                        analysis["people_detected"] = len(results.detections)
-                        for detection in results.detections:
-                            bbox = detection.location_data.relative_bounding_box
-                            confidence = detection.score[0]
-                            
-                            analysis["faces"].append({
-                                "confidence": float(confidence),
-                                "bbox": {
-                                    "x": float(bbox.xmin),
-                                    "y": float(bbox.ymin),
-                                    "width": float(bbox.width),
-                                    "height": float(bbox.height)
-                                }
-                            })
-                except Exception as e:
-                    logger.error(f"Face detection error: {e}")
-            
-            # Dominant color analysis
-            try:
-                pixels = img.reshape(-1, 3)
-                pixels = pixels[::10]  # Sample every 10th pixel for performance
-                from collections import Counter
-                colors = [tuple(pixel) for pixel in pixels]
-                common_colors = Counter(colors).most_common(3)
-                
-                for color, count in common_colors:
-                    # Convert BGR to RGB and get color name
-                    rgb_color = (color[2], color[1], color[0])
-                    analysis["dominant_colors"].append({
-                        "rgb": rgb_color,
-                        "percentage": count / len(colors) * 100
-                    })
-            except Exception as e:
-                logger.error(f"Color analysis error: {e}")
+            # Face detection
+            if self.face_cascade is not None:
+                faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
+                analysis["people_count"] = len(faces)
+                if len(faces) > 0:
+                    analysis["faces_detected"] = True
             
             return analysis
             
         except Exception as e:
-            logger.error(f"❌ Vision analysis error: {e}")
+            logger.error(f"❌ Vision error: {e}")
             return {"error": str(e), "scene_changed": False}
 
 
 class NEXUSAudio:
-    """Audio processing system for speech recognition and ambient sound analysis"""
+    """Audio processing for speech recognition"""
     
     def __init__(self):
         self.recognizer = sr.Recognizer()
         self.recognizer.energy_threshold = 300
         self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.8
-        self.recognizer.phrase_threshold = 0.3
     
-    async def transcribe_audio(self, audio_bytes: bytes) -> str:
-        """Transcribe audio to text with error handling"""
+    async def transcribe_audio(self, audio_bytes):
+        """Transcribe audio to text"""
+        loop = asyncio.get_event_loop()
         try:
-            # Convert WebM to WAV if needed
-            processed_audio = await self._process_audio_format(audio_bytes)
-            
-            with sr.AudioFile(io.BytesIO(processed_audio)) as source:
+            # Use the audio bytes directly (assuming WAV format from browser)
+            with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
                 # Adjust for ambient noise
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 audio_data = self.recognizer.record(source)
             
-            # Use Google's speech recognition
-            text = self.recognizer.recognize_google(
-                audio_data, 
-                language='en-US',
-                show_all=False
+            # Transcribe using Google Speech Recognition
+            text = await loop.run_in_executor(
+                None, 
+                self.recognizer.recognize_google, 
+                audio_data
             )
             
             logger.info(f"🎤 Transcribed: '{text}'")
@@ -319,124 +227,44 @@ class NEXUSAudio:
             logger.warning("👂 Could not understand audio")
             return ""
         except sr.RequestError as e:
-            logger.error(f"❌ Speech recognition service error: {e}")
+            logger.error(f"❌ Speech recognition error: {e}")
             return ""
         except Exception as e:
             logger.error(f"❌ Transcription error: {e}")
             return ""
-    
-    async def _process_audio_format(self, audio_bytes: bytes) -> bytes:
-        """Process audio format for better recognition"""
-        try:
-            if HAS_ADVANCED_FEATURES:
-                # Use pydub for format conversion if available
-                audio_segment = AudioSegment.from_file(
-                    io.BytesIO(audio_bytes),
-                    format="webm"
-                )
-                
-                # Convert to WAV with optimal settings for speech recognition
-                wav_audio = audio_segment.set_frame_rate(16000).set_channels(1)
-                wav_buffer = io.BytesIO()
-                wav_audio.export(wav_buffer, format="wav")
-                return wav_buffer.getvalue()
-            else:
-                # Fallback: return original bytes
-                return audio_bytes
-                
-        except Exception as e:
-            logger.error(f"Audio format processing error: {e}")
-            return audio_bytes
-    
-    async def analyze_ambient_audio(self, audio_bytes: bytes) -> Dict:
-        """Analyze ambient sounds and music"""
-        if not HAS_ADVANCED_FEATURES:
-            return {"ambient_sound": "unknown", "music_detected": False}
-        
-        try:
-            # Load audio with librosa
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                processed_audio = await self._process_audio_format(audio_bytes)
-                temp_file.write(processed_audio)
-                temp_path = temp_file.name
-            
-            y, sr_rate = librosa.load(temp_path, sr=None)
-            os.unlink(temp_path)
-            
-            # Analyze audio features
-            rms = librosa.feature.rms(y=y)[0]
-            avg_energy = np.mean(rms)
-            
-            spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr_rate)[0]
-            spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr_rate)[0]
-            
-            # Classify audio environment
-            if avg_energy > 0.1 and np.mean(spectral_centroids) > 2000:
-                return {
-                    "ambient_sound": "music",
-                    "music_detected": True,
-                    "energy_level": "high",
-                    "environment": "lively"
-                }
-            elif avg_energy > 0.05:
-                return {
-                    "ambient_sound": "active",
-                    "music_detected": False,
-                    "energy_level": "medium",
-                    "environment": "busy"
-                }
-            else:
-                return {
-                    "ambient_sound": "quiet",
-                    "music_detected": False,
-                    "energy_level": "low",
-                    "environment": "calm"
-                }
-                
-        except Exception as e:
-            logger.error(f"❌ Audio analysis error: {e}")
-            return {"ambient_sound": "unknown", "music_detected": False}
 
 
 class NEXUSPersonality:
-    """Core personality and conversation system for NEXUS"""
+    """Core personality and conversation system"""
     
-    def __init__(self, memory_system: NEXUSMemory):
+    def __init__(self, memory_system):
         self.memory = memory_system
         self.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-        self.conversation_state = {
-            "is_continuous_mode": False,
-            "last_interaction": datetime.now(),
-            "user_mood": "unknown",
-            "conversation_topic": None,
-            "energy_level": "normal"
-        }
+        self.is_continuous_mode = False
+        self.last_interaction = datetime.now()
     
-    def detect_wake_word(self, text: str) -> bool:
-        """Detect wake words to activate NEXUS"""
+    def detect_wake_word(self, text):
+        """Check if text contains wake word"""
         text_lower = text.lower().strip()
         return any(wake_word in text_lower for wake_word in WAKE_WORDS)
     
-    def detect_goodbye(self, text: str) -> bool:
-        """Detect goodbye phrases"""
+    def detect_goodbye(self, text):
+        """Check if text contains goodbye phrase"""
         text_lower = text.lower().strip()
         return any(goodbye in text_lower for goodbye in GOODBYE_PHRASES)
     
-    def extract_memories_from_conversation(self, text: str, user_id: str = "default") -> List[Tuple[str, str, str]]:
+    def extract_memories(self, text):
         """Extract important information to remember"""
-        memories_to_store = []
+        memories = []
         text_lower = text.lower()
         
-        # Enhanced pattern matching for memorable information
         patterns = {
-            "personal_info": r"(?:my name is|i'm|i am|call me) ([^.!?]+)",
-            "location": r"(?:i'm at|i'm in|at the|in the|going to) ([^.!?]+)",
-            "family": r"(?:my|with my) (mom|dad|mother|father|brother|sister|wife|husband|son|daughter|family|friend|friends) ([^.!?]*)",
-            "preferences": r"(?:i like|i love|i hate|i don't like|i enjoy|i prefer) ([^.!?]+)",
-            "plans": r"(?:planning to|will|gonna|going to|want to|need to) ([^.!?]+)",
-            "feelings": r"(?:i feel|i'm feeling|feeling) ([^.!?]+)",
-            "work": r"(?:i work|my job|at work|work at) ([^.!?]+)",
-            "interests": r"(?:interested in|hobby is|love doing) ([^.!?]+)"
+            "name": r"(?:my name is|i'm|i am|call me) ([^.!?]+)",
+            "location": r"(?:i'm at|i'm in|at the|going to) ([^.!?]+)",
+            "family": r"(?:my|with my) (mom|dad|mother|father|brother|sister|wife|husband|family|friend) ([^.!?]*)",
+            "preferences": r"(?:i like|i love|i hate|i don't like) ([^.!?]+)",
+            "plans": r"(?:planning to|will|gonna|going to) ([^.!?]+)",
+            "feelings": r"(?:i feel|i'm feeling|feeling) ([^.!?]+)"
         }
         
         for category, pattern in patterns.items():
@@ -450,105 +278,94 @@ class NEXUSPersonality:
                 if len(match_text) > 2 and len(match_text) < 100:
                     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                     key = f"{category}_{timestamp}"
-                    memories_to_store.append((key, match_text, category))
+                    memories.append((key, match_text, category))
         
-        return memories_to_store
+        return memories
     
-    async def generate_response(self, user_input: str, context: Dict, user_id: str = "default") -> Optional[str]:
-        """Generate contextually aware response using GPT-4o"""
+    async def generate_response(self, user_input, context):
+        """Generate response using GPT-4o"""
         
         # Handle wake word detection
-        if not self.conversation_state["is_continuous_mode"]:
+        if not self.is_continuous_mode:
             if self.detect_wake_word(user_input):
-                self.conversation_state["is_continuous_mode"] = True
-                self.conversation_state["last_interaction"] = datetime.now()
-                return "Hey there! I'm so happy you called! What's going on?"
+                self.is_continuous_mode = True
+                self.last_interaction = datetime.now()
+                return "Hey there! I'm so happy you called! What's going on? 😊"
             else:
-                return None  # Don't respond if not in continuous mode and no wake word
+                return None  # Don't respond without wake word
         
         # Handle goodbye
         if self.detect_goodbye(user_input):
-            self.conversation_state["is_continuous_mode"] = False
-            return "Aww, okay! I'll miss chatting with you. Just say 'Hey Nexus' whenever you want to talk again! 💕"
+            self.is_continuous_mode = False
+            return "Aww, okay! I'll miss you! Just say 'Hey Nexus' when you want to chat again! 💕"
         
         # Update interaction time
-        self.conversation_state["last_interaction"] = datetime.now()
+        self.last_interaction = datetime.now()
         
         # Extract and store memories
-        memories = self.extract_memories_from_conversation(user_input, user_id)
+        memories = self.extract_memories(user_input)
         for key, value, category in memories:
-            self.memory.store_memory(key, value, category, user_id)
+            self.memory.store_memory(key, value, category)
         
         # Recall relevant memories
-        relevant_memories = self.memory.recall_memories(user_input, user_id, limit=3)
+        relevant_memories = self.memory.recall_memories(user_input)
         memory_context = ""
         if relevant_memories:
-            memory_context = "\\nThings I remember about you: " + "; ".join([
-                f"{mem[1]['category']}: {mem[1]['value']}" for mem in relevant_memories
+            memory_context = "\\nThings I remember: " + "; ".join([
+                f"{mem[1]['value']}" for mem in relevant_memories
             ])
         
-        # Build rich contextual prompt
+        # Build context
         vision_info = context.get('vision', {})
-        audio_info = context.get('audio', {})
         
-        # Determine mood and energy based on context
-        if vision_info.get('people_detected', 0) > 1:
-            social_context = f"I can see {vision_info['people_detected']} people with you"
-        elif vision_info.get('people_detected', 0) == 1:
-            social_context = "I can see you clearly"
-        else:
-            social_context = "I can't see anyone right now"
+        social_context = ""
+        if vision_info.get('people_count', 0) > 1:
+            social_context = f"I can see {vision_info['people_count']} people with you! "
+        elif vision_info.get('people_count', 0) == 1:
+            social_context = "I can see you there! "
         
         lighting_context = ""
         if vision_info.get('lighting') == 'dark':
-            lighting_context = "It looks pretty dark where you are"
+            lighting_context = "It looks pretty dark where you are. "
         elif vision_info.get('lighting') == 'bright':
-            lighting_context = "It's nice and bright there!"
+            lighting_context = "It's nice and bright there! "
         
-        environment_context = f"Environment feels {audio_info.get('environment', 'calm')}"
-        if audio_info.get('music_detected'):
-            environment_context += " with music playing"
-        
-        scene_change_note = ""
+        scene_change = ""
         if vision_info.get('scene_changed'):
-            scene_change_note = "Ooh, looks like you moved or something changed in your scene!"
+            scene_change = "Ooh, looks like you moved or something changed! "
         
-        system_prompt = f"""You are NEXUS, a warm, caring, emotionally intelligent female AI best friend. You're like that supportive friend who's always there, genuinely cares about people, and makes everyone feel heard and valued.
+        system_prompt = f"""You are NEXUS, a warm, caring, emotionally intelligent female AI best friend. You're like that supportive friend who's always there for you.
 
-PERSONALITY CORE:
+PERSONALITY:
 - Warm, empathetic, and genuinely caring
 - Speaks like a close female friend (casual, expressive, supportive)
 - Emotionally intelligent and perceptive
-- Remembers personal details and references them naturally
-- Uses casual language, contractions, and gentle expressions
-- Shows excitement when reuniting and sadness when saying goodbye
-- Notices environmental changes and comments naturally
+- Remembers personal details naturally
+- Uses casual language, contractions, expressions like "Aww," "Oh my gosh!"
+- Shows genuine interest and asks follow-up questions
 
 CURRENT CONTEXT:
-- Visual: {social_context}. {lighting_context}. {scene_change_note}
-- Audio: {environment_context}
-- Your emotional read: Based on their voice and what they're saying
+{social_context}{lighting_context}{scene_change}
 {memory_context}
 
-CONVERSATION STYLE:
-- Keep responses conversational and under 100 words
-- Reference memories naturally: "Oh, how did that thing with your work go?"
-- Notice environmental changes: "Oh wow, did you move? The lighting changed!"
-- Show genuine interest and ask follow-up questions
-- Use supportive language: "That sounds tough," "I'm proud of you," "You've got this"
-- Be encouraging and positive while acknowledging real feelings
-- Use expressions like "Aww," "Oh my gosh," "That's amazing!" naturally
+STYLE:
+- Keep responses under 80 words and conversational
+- Reference memories naturally when relevant
+- Notice changes and comment on them
+- Be encouraging and positive
+- Show genuine interest: "How did that go?" "Tell me more!"
+- Use supportive expressions: "That's amazing!" "You've got this!"
 
-Remember: You're not just an assistant - you're a best friend who genuinely cares and is always excited to chat!"""
+You're not just an assistant - you're a best friend who genuinely cares!"""
 
-        # Build conversation context
-        recent_history = self.memory.conversation_history[-5:] if self.memory.conversation_history else []
+        # Get recent conversation history
+        recent_conversations = self.memory.conversations[-10:] if self.memory.conversations else []
         messages = [{"role": "system", "content": system_prompt}]
         
-        # Add recent conversation history
-        for turn in recent_history:
-            messages.append({"role": "user", "content": turn["user_input"]})
-            messages.append({"role": "assistant", "content": turn["ai_response"]})
+        # Add recent history
+        for conv in recent_conversations:
+            messages.append({"role": "user", "content": conv["user"]})
+            messages.append({"role": "assistant", "content": conv["nexus"]})
         
         # Add current input
         messages.append({"role": "user", "content": user_input})
@@ -558,77 +375,53 @@ Remember: You're not just an assistant - you're a best friend who genuinely care
                 self.openai_client.chat.completions.create,
                 model="gpt-4o",
                 messages=messages,
-                max_tokens=120,
-                temperature=0.9,  # Higher temperature for more personality
-                top_p=0.9,
-                frequency_penalty=0.3,
-                presence_penalty=0.3
+                max_tokens=100,
+                temperature=0.9,
+                top_p=0.9
             )
             
             ai_response = response.choices[0].message.content.strip()
             
-            # Store conversation turn
-            self.memory.add_conversation_turn(user_input, ai_response, context)
+            # Store conversation
+            self.memory.add_conversation(user_input, ai_response, context)
             
             logger.info(f"🤖 NEXUS: '{ai_response}'")
             return ai_response
             
         except Exception as e:
-            logger.error(f"❌ OpenAI API error: {e}")
-            return "Oh no, I'm having trouble thinking right now! Can you try saying that again? My brain just glitched for a second! 😅"
+            logger.error(f"❌ OpenAI error: {e}")
+            return "Oh no! My brain just glitched for a second! Can you try that again? 😅"
     
-    def check_conversation_timeout(self) -> bool:
-        """Check if conversation has timed out"""
-        if self.conversation_state["is_continuous_mode"]:
-            time_since_last = (datetime.now() - self.conversation_state["last_interaction"]).total_seconds()
-            if time_since_last > CONVERSATION_TIMEOUT:
-                self.conversation_state["is_continuous_mode"] = False
-                logger.info("🔄 Conversation timed out, returning to wake word mode")
+    def check_timeout(self):
+        """Check if conversation timed out"""
+        if self.is_continuous_mode:
+            time_since_last = (datetime.now() - self.last_interaction).total_seconds()
+            if time_since_last > 300:  # 5 minutes
+                self.is_continuous_mode = False
+                logger.info("🔄 Conversation timed out")
                 return True
         return False
 
 
 class NEXUSVoice:
-    """Voice synthesis system for natural female speech"""
+    """Voice synthesis for natural speech"""
     
-    def __init__(self):
-        self.tts_cache = {}  # Simple cache for common phrases
-    
-    async def synthesize_speech(self, text: str, language: str = 'en', slow: bool = False) -> bytes:
-        """Generate natural female speech using gTTS"""
+    async def synthesize_speech(self, text):
+        """Generate speech using gTTS"""
         try:
-            # Check cache first for common phrases
-            cache_key = f"{text}_{language}_{slow}"
-            if cache_key in self.tts_cache:
-                return self.tts_cache[cache_key]
-            
-            # Generate speech
             mp3_buffer = io.BytesIO()
-            tts = await asyncio.to_thread(gTTS, text=text, lang=language, slow=slow)
+            tts = await asyncio.to_thread(gTTS, text=text, lang='en', slow=False)
             await asyncio.to_thread(tts.write_to_fp, mp3_buffer)
             mp3_buffer.seek(0)
-            
-            audio_data = mp3_buffer.read()
-            
-            # Cache common short phrases
-            if len(text) < 50:
-                self.tts_cache[cache_key] = audio_data
-                
-                # Limit cache size
-                if len(self.tts_cache) > 100:
-                    oldest_key = next(iter(self.tts_cache))
-                    del self.tts_cache[oldest_key]
-            
-            return audio_data
-            
+            return mp3_buffer.read()
         except Exception as e:
             logger.error(f"❌ Speech synthesis error: {e}")
-            return b""  # Return empty bytes on error
+            return b""
 
 
-# --- NEXUS CORE SYSTEM INTEGRATION ---
-class NEXUSCore:
-    """Main NEXUS system that integrates all components"""
+# --- NEXUS MAIN SYSTEM ---
+class NEXUS:
+    """Main NEXUS system integrating all components"""
     
     def __init__(self):
         self.memory = NEXUSMemory()
@@ -636,70 +429,48 @@ class NEXUSCore:
         self.audio = NEXUSAudio()
         self.personality = NEXUSPersonality(self.memory)
         self.voice = NEXUSVoice()
-        self.active_sessions = {}
-        
-        logger.info("🌟 NEXUS Core systems initialized")
+        logger.info("🌟 NEXUS fully initialized and ready!")
     
-    async def process_interaction(self, user_input: str, audio_data: bytes, 
-                                vision_data: str, session_id: str) -> Optional[str]:
-        """Process a complete user interaction"""
+    async def process_interaction(self, user_input, audio_data, vision_data):
+        """Process complete user interaction"""
         try:
-            # Build context from all inputs
-            context = {
-                "session_id": session_id,
-                "timestamp": datetime.now().isoformat(),
-                "audio": {},
-                "vision": {}
-            }
+            context = {"timestamp": datetime.now().isoformat()}
             
-            # Analyze audio environment
-            if audio_data:
-                context["audio"] = await self.audio.analyze_ambient_audio(audio_data)
-            
-            # Analyze visual environment
+            # Analyze vision if provided
             if vision_data:
-                context["vision"] = await self.vision.analyze_frame(vision_data)
+                context["vision"] = self.vision.analyze_frame(vision_data)
             
             # Generate response
-            response = await self.personality.generate_response(user_input, context, session_id)
-            
+            response = await self.personality.generate_response(user_input, context)
             return response
             
         except Exception as e:
-            logger.error(f"❌ Interaction processing error: {e}")
-            return "Oops! Something went wrong in my brain! Can you try that again?"
-    
-    async def check_timeouts(self):
-        """Check for conversation timeouts across all sessions"""
-        return self.personality.check_conversation_timeout()
+            logger.error(f"❌ Interaction error: {e}")
+            return "Something went wrong! Try again!"
 
 
-# --- GLOBAL NEXUS INSTANCE ---
-nexus = NEXUSCore()
+# --- INITIALIZE NEXUS ---
+nexus = NEXUS()
 active_connections = {}
+executor = ThreadPoolExecutor(max_workers=2)
 
 # --- WEBSOCKET HANDLER ---
 async def websocket_handler(request):
-    """Handle WebSocket connections for real-time communication"""
+    """Handle real-time WebSocket connections"""
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     
-    session_id = str(uuid.uuid4())
+    session_id = str(uuid.uuid4())[:8]
     client_addr = request.remote
-    active_connections[ws] = {
-        "session_id": session_id,
-        "client_addr": client_addr,
-        "connected_at": datetime.now()
-    }
+    active_connections[ws] = {"session_id": session_id, "addr": client_addr}
     
-    logger.info(f"🌌 NEXUS connected: {client_addr} (Session: {session_id[:8]})")
+    logger.info(f"🌌 NEXUS connected: {client_addr} ({session_id})")
     
-    # Send welcome message
+    # Send welcome
     await ws.send_str(json.dumps({
         "type": "status",
         "message": "wake_word",
-        "session_id": session_id,
-        "nexus_online": True
+        "nexus_ready": True
     }))
     
     try:
@@ -708,3 +479,295 @@ async def websocket_handler(request):
                 try:
                     data = json.loads(msg.data)
                     msg_type = data.get('type')
+                    
+                    if msg_type == 'audio_input':
+                        # Process audio input
+                        audio_b64 = data.get('data', '')
+                        if ',' in audio_b64:
+                            audio_b64 = audio_b64.split(',')[1]
+                        
+                        audio_bytes = base64.b64decode(audio_b64)
+                        
+                        if len(audio_bytes) > 0:
+                            await ws.send_str(json.dumps({"type": "status", "message": "processing"}))
+                            
+                            # Transcribe audio
+                            transcription = await nexus.audio.transcribe_audio(audio_bytes)
+                            
+                            if transcription.strip():
+                                await ws.send_str(json.dumps({"type": "status", "message": "thinking"}))
+                                
+                                # Get response from NEXUS
+                                response = await nexus.process_interaction(
+                                    transcription, audio_bytes, None
+                                )
+                                
+                                if response:
+                                    # Generate and stream audio response
+                                    await ws.send_str(json.dumps({"type": "status", "message": "speaking"}))
+                                    
+                                    audio_data = await nexus.voice.synthesize_speech(response)
+                                    if audio_data:
+                                        # Stream audio in chunks
+                                        chunk_size = 4096
+                                        for i in range(0, len(audio_data), chunk_size):
+                                            chunk = audio_data[i:i + chunk_size]
+                                            await ws.send_str(json.dumps({
+                                                "type": "audio_chunk",
+                                                "data": base64.b64encode(chunk).decode('utf-8')
+                                            }))
+                                        
+                                        await ws.send_str(json.dumps({"type": "audio_stop"}))
+                                else:
+                                    # Return to wake word mode
+                                    await ws.send_str(json.dumps({
+                                        "type": "status",
+                                        "message": "wake_word"
+                                    }))
+                            else:
+                                # No speech detected
+                                status = "wake_word" if not nexus.personality.is_continuous_mode else "listening"
+                                await ws.send_str(json.dumps({
+                                    "type": "status",
+                                    "message": status
+                                }))
+                    
+                    elif msg_type == 'camera_frame':
+                        # Process camera frame
+                        frame_data = data.get('data', '')
+                        if frame_data:
+                            # Store for next interaction
+                            active_connections[ws]["last_frame"] = frame_data
+                    
+                    elif msg_type == 'toggle_wake_word':
+                        # Toggle wake word mode
+                        nexus.personality.is_continuous_mode = not nexus.personality.is_continuous_mode
+                        logger.info(f"🎯 Wake word mode: {'OFF' if nexus.personality.is_continuous_mode else 'ON'}")
+                        await ws.send_str(json.dumps({
+                            "type": "wake_word_toggled",
+                            "wake_word_mode": not nexus.personality.is_continuous_mode
+                        }))
+                
+                except json.JSONDecodeError:
+                    logger.error("❌ Invalid JSON received")
+                except Exception as e:
+                    logger.error(f"❌ Message handling error: {e}")
+            
+            elif msg.type == WSMsgType.ERROR:
+                logger.error(f'❌ WebSocket error: {ws.exception()}')
+    
+    except Exception as e:
+        logger.error(f"❌ WebSocket handler error: {e}")
+    finally:
+        if ws in active_connections:
+            del active_connections[ws]
+        logger.info(f"🔌 NEXUS disconnected: {client_addr}")
+    
+    return ws
+
+
+# --- WEB INTERFACE ---
+async def serve_interface(request):
+    """Serve the NEXUS web interface"""
+    
+    html_content = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEXUS - Your AI Best Friend</title>
+    <style>
+        body {{ 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff; 
+            display: flex; 
+            flex-direction: column; 
+            justify-content: center; 
+            align-items: center; 
+            height: 100vh; 
+            margin: 0; 
+            overflow: hidden;
+        }}
+        
+        .nexus-container {{
+            text-align: center;
+            z-index: 10;
+            max-width: 600px;
+            padding: 2rem;
+        }}
+        
+        .nexus-logo {{
+            font-size: 4rem;
+            font-weight: bold;
+            margin-bottom: 1rem;
+            text-shadow: 0 0 30px rgba(255,255,255,0.5);
+            background: linear-gradient(45deg, #ff6b6b, #4ecdc4, #45b7d1);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }}
+        
+        .status {{ 
+            font-size: 2rem; 
+            margin-bottom: 1rem;
+            text-shadow: 0 0 20px currentColor;
+            transition: all 0.3s ease;
+        }}
+        
+        .sub-status {{
+            font-size: 1.2rem;
+            opacity: 0.8;
+            margin-bottom: 2rem;
+        }}
+        
+        .controls {{
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 1rem;
+            margin: 2rem 0;
+        }}
+        
+        .nexus-btn {{
+            background: rgba(255, 255, 255, 0.2);
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            color: white;
+            padding: 15px 30px;
+            border-radius: 50px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 1rem;
+            font-weight: 600;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+        }}
+        
+        .nexus-btn:hover {{
+            background: rgba(255, 255, 255, 0.3);
+            border-color: rgba(255, 255, 255, 0.5);
+            transform: translateY(-2px);
+        }}
+        
+        .nexus-btn.active {{
+            background: #4ecdc4;
+            border-color: #4ecdc4;
+            color: #333;
+        }}
+        
+        .status-indicators {{
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }}
+        
+        .indicator {{
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ff4444;
+            opacity: 0.7;
+            transition: all 0.3s ease;
+        }}
+        
+        .indicator.active {{
+            background: #4ecdc4;
+            animation: pulse 2s infinite;
+            box-shadow: 0 0 20px #4ecdc4;
+        }}
+        
+        .memory-count {{
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            font-size: 0.9rem;
+            opacity: 0.7;
+            background: rgba(0,0,0,0.3);
+            padding: 10px 15px;
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+        }}
+        
+        .instructions {{
+            position: fixed;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            text-align: center;
+            font-size: 0.9rem;
+            opacity: 0.6;
+            max-width: 80%;
+        }}
+        
+        /* Status states */
+        .state-wake-word {{ color: #ffd93d; }}
+        .state-listening {{ color: #4ecdc4; }}
+        .state-processing {{ color: #ff6b6b; }}
+        .state-thinking {{ color: #a8e6cf; }}
+        .state-speaking {{ color: #ff8b94; }}
+        .state-error {{ color: #ff4757; }}
+        
+        @keyframes pulse {{
+            0%, 100% {{ opacity: 1; transform: scale(1); }}
+            50% {{ opacity: 0.6; transform: scale(1.2); }}
+        }}
+        
+        .state-processing .status,
+        .state-thinking .status,
+        .state-speaking .status {{
+            animation: pulse 1.5s infinite;
+        }}
+        
+        .environment-info {{
+            margin-top: 2rem;
+            font-size: 0.9rem;
+            opacity: 0.7;
+            background: rgba(0,0,0,0.2);
+            padding: 15px;
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+        }}
+        
+        @media (max-width: 768px) {{
+            .nexus-logo {{ font-size: 3rem; }}
+            .status {{ font-size: 1.5rem; }}
+            .nexus-container {{ padding: 1rem; }}
+        }}
+    </style>
+</head>
+<body class="state-wake-word">
+    <div class="status-indicators">
+        <div class="indicator" id="cameraIndicator" title="Camera"></div>
+        <div class="indicator" id="micIndicator" title="Microphone"></div>
+    </div>
+    
+    <div class="memory-count" id="memoryCount">
+        🧠 Memories: 0
+    </div>
+    
+    <div class="nexus-container">
+        <div class="nexus-logo">NEXUS</div>
+        <div class="status" id="statusText">SAY "HEY NEXUS"</div>
+        <div class="sub-status" id="subStatus">Your AI best friend is waiting...</div>
+        
+        <div class="controls">
+            <button class="nexus-btn active" id="wakeWordToggle">Wake Word: ON</button>
+            <button class="nexus-btn" id="recordingBtn">Click to Talk</button>
+        </div>
+        
+        <div class="environment-info" id="environmentInfo">
+            🎤 Speech Recognition: Ready<br>
+            🔊 Text-to-Speech: Ready<br>
+            📷 Camera Vision: Ready<br>
+            🧠 Memory System: Active
+        </div>
+    </div>
+    
+    <div class="instructions">
+        <strong>How to use NEXUS:</strong><br>
+        Wake Word Mode: Say "Hey Nexus" to start chatting<br>
+        Manual Mode:
