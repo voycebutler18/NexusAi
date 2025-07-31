@@ -2,24 +2,17 @@
 aiohttp==3.8.6
 aiohttp-cors==0.7.0
 
-# OpenAI API for GPT-4o
-openai==1.35.0
+# OpenAI API
+openai==1.30.0
 
 # Configuration
 python-dotenv==1.0.0
 
-# Text-to-speech (reliable and lightweight)
-gTTS==2.4.0
+# Text-to-speech
+gTTS==2.3.2
 
-# Speech recognition
-SpeechRecognition==3.10.0
+# Basic data processing
+numpy==1.24.3
 
-# Basic image processing (headless for server deployment)
-opencv-python-headless==4.8.1.78
-
-# Essential data processing
-numpy==1.24.4
-Pillow==10.0.1
-
-# WebSocket support
-websockets==11.0.3
+# Image processing (minimal)
+Pillow==9.5.0
