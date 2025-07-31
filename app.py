@@ -1,3 +1,9 @@
+"""
+NEXUS - AI-Powered Voice-Activated Camera-Aware Virtual Companion
+A real-time best friend experience that talks, listens, watches, and responds like a human.
+Deployed on Render for 24/7 cloud access.
+"""
+
 import os
 from dotenv import load_dotenv
 import openai
@@ -10,490 +16,690 @@ import aiohttp_cors
 import logging
 import io
 import tempfile
-import subprocess
 import speech_recognition as sr
 from gtts import gTTS
 import cv2
 import numpy as np
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
+import uuid
+from typing import Dict, List, Optional, Tuple
+import gc
 
-# Try to import optional libraries
+# Try to import optional libraries with graceful fallbacks
 try:
-    from fer import FER
-    HAS_EMOTION_DETECTION = True
-except ImportError:
-    HAS_EMOTION_DETECTION = False
-    logging.warning("FER library not available. Emotion detection will be disabled.")
-
-try:
+    import mediapipe as mp
     import librosa
     import soundfile as sf
-    HAS_AUDIO_ANALYSIS = True
+    from pydub import AudioSegment
+    HAS_ADVANCED_FEATURES = True
 except ImportError:
-    HAS_AUDIO_ANALYSIS = False
-    logging.warning("Audio analysis libraries not available. Music detection disabled.")
+    HAS_ADVANCED_FEATURES = False
+    logging.warning("Advanced features disabled due to missing dependencies")
 
-# --- CONFIGURATION AND INITIALIZATION ---
+# --- RENDER DEPLOYMENT CONFIGURATION ---
 load_dotenv()
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# --- API & Server Config ---
-PORT = int(os.getenv('PORT', 8080))
-HOST = os.getenv('HOST', '0.0.0.0')
-HISTORY_FILE = "conversation_history.json"
-MEMORY_FILE = "nexus_memory.json"
-WAKE_WORDS = ["hey nexus", "nexus", "hey assistant"]
-GOODBYE_PHRASES = ["goodbye", "bye nexus", "see you later", "goodnight"]
+# Render-specific settings
+PORT = int(os.getenv('PORT', 10000))
+HOST = '0.0.0.0'
+DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 
-# --- API CLIENTS & ML MODELS ---
-try:
-    openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
-    if HAS_EMOTION_DETECTION:
-        emotion_detector = FER(mtcnn=True)
-        logger.info("✅ Emotion detection enabled.")
-    else:
-        emotion_detector = None
-        logger.info("⚠️ Emotion detection disabled.")
+# Use /tmp for ephemeral storage on Render
+BASE_DIR = "/tmp" if not DEBUG else "."
+MEMORY_FILE = os.path.join(BASE_DIR, "nexus_memory.json")
+CONVERSATION_FILE = os.path.join(BASE_DIR, "conversations.json")
+USER_PROFILES_FILE = os.path.join(BASE_DIR, "user_profiles.json")
+
+# NEXUS personality and behavior constants
+WAKE_WORDS = ["hey nexus", "nexus", "hey girl", "hey friend"]
+GOODBYE_PHRASES = ["goodbye nexus", "bye girl", "see you later", "goodnight", "talk to you later"]
+CONVERSATION_TIMEOUT = 300  # 5 minutes of silence before returning to wake word mode
+
+# --- NEXUS CORE SYSTEMS ---
+class NEXUSMemory:
+    """Advanced memory system for NEXUS to remember conversations and users"""
     
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300  # Adjust for wake word detection
-    logger.info("✅ API clients and speech recognizer initialized.")
-except Exception as e:
-    logger.error(f"❌ Failed to initialize clients: {e}")
-    raise
-
-# --- GLOBAL STATE & CONTEXT MANAGEMENT ---
-active_connections = {}
-conversation_context = []
-nexus_memory = {}
-visual_context = {
-    "description": "No visual data available.", 
-    "emotion": "unknown",
-    "people_count": 0,
-    "scene_changed": False,
-    "last_scene_hash": None
-}
-audio_context = {
-    "ambient_sound": "quiet",
-    "music_detected": False,
-    "background_activity": "calm"
-}
-
-is_wake_word_mode = True
-is_listening_continuously = False
-last_face_encoding = None
-
-executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
-
-# --- MEMORY MANAGEMENT ---
-def load_nexus_memory():
-    global nexus_memory
-    if os.path.exists(MEMORY_FILE):
+    def __init__(self):
+        self.memories: Dict = {}
+        self.user_profiles: Dict = {}
+        self.conversation_history: List = []
+        self.load_all_data()
+    
+    def load_all_data(self):
+        """Load all persistent data"""
+        for file_path, attr_name in [
+            (MEMORY_FILE, 'memories'),
+            (USER_PROFILES_FILE, 'user_profiles'),
+            (CONVERSATION_FILE, 'conversation_history')
+        ]:
+            try:
+                if os.path.exists(file_path):
+                    with open(file_path, 'r') as f:
+                        setattr(self, attr_name, json.load(f))
+                    logger.info(f"✅ Loaded {attr_name}: {len(getattr(self, attr_name))} entries")
+            except Exception as e:
+                logger.error(f"⚠️ Could not load {attr_name}: {e}")
+                setattr(self, attr_name, {} if attr_name != 'conversation_history' else [])
+    
+    def save_data(self, data_type: str):
+        """Save specific data type"""
+        file_map = {
+            'memories': MEMORY_FILE,
+            'user_profiles': USER_PROFILES_FILE,
+            'conversation_history': CONVERSATION_FILE
+        }
+        
         try:
-            with open(MEMORY_FILE, 'r') as f:
-                nexus_memory = json.load(f)
-            logger.info(f"🧠 Nexus memory loaded: {len(nexus_memory)} entries.")
+            file_path = file_map[data_type]
+            data = getattr(self, data_type)
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=2)
         except Exception as e:
-            logger.error(f"⚠️ Could not load memory: {e}. Starting fresh.")
-            nexus_memory = {}
-
-def save_nexus_memory():
-    try:
-        with open(MEMORY_FILE, 'w') as f:
-            json.dump(nexus_memory, f, indent=2)
-    except Exception as e:
-        logger.error(f"⚠️ Could not save memory: {e}.")
-
-def store_memory(key, value, category="general"):
-    """Store a memory with timestamp and category"""
-    nexus_memory[key] = {
-        "value": value,
-        "category": category,
-        "timestamp": datetime.now().isoformat(),
-        "access_count": nexus_memory.get(key, {}).get("access_count", 0) + 1
-    }
-    save_nexus_memory()
-
-def recall_memory(query, limit=5):
-    """Intelligent memory recall based on query"""
-    relevant_memories = []
-    query_lower = query.lower()
+            logger.error(f"⚠️ Could not save {data_type}: {e}")
     
-    for key, memory in nexus_memory.items():
-        score = 0
-        if query_lower in key.lower():
-            score += 3
-        if query_lower in str(memory["value"]).lower():
-            score += 2
-        
-        # Boost recent memories
-        try:
-            timestamp = datetime.fromisoformat(memory["timestamp"])
-            days_old = (datetime.now() - timestamp).days
-            if days_old < 7:
-                score += 1
-        except:
-            pass
-            
-        if score > 0:
-            relevant_memories.append((key, memory, score))
-    
-    # Sort by relevance score and return top results
-    relevant_memories.sort(key=lambda x: x[2], reverse=True)
-    return relevant_memories[:limit]
-
-# --- CONVERSATION PERSISTENCE ---
-def load_conversation_history():
-    global conversation_context
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, 'r') as f:
-                conversation_context = json.load(f)
-            logger.info(f"🧠 Conversation history loaded.")
-        except Exception as e:
-            logger.error(f"⚠️ Could not load history: {e}. Starting fresh.")
-            conversation_context = []
-
-def save_conversation_history():
-    try:
-        with open(HISTORY_FILE, 'w') as f:
-            json.dump(conversation_context, f, indent=2)
-    except Exception as e:
-        logger.error(f"⚠️ Could not save history: {e}.")
-
-# --- WAKE WORD DETECTION ---
-def detect_wake_word(text):
-    """Check if text contains wake word"""
-    text_lower = text.lower().strip()
-    return any(wake_word in text_lower for wake_word in WAKE_WORDS)
-
-def detect_goodbye(text):
-    """Check if text contains goodbye phrase"""
-    text_lower = text.lower().strip()
-    return any(goodbye in text_lower for goodbye in GOODBYE_PHRASES)
-
-# --- AUDIO PROCESSING FUNCTIONS ---
-async def convert_webm_to_wav(webm_bytes):
-    """Convert WebM audio to WAV format using ffmpeg."""
-    try:
-        with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as webm_file:
-            webm_file.write(webm_bytes)
-            webm_path = webm_file.name
-
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as wav_file:
-            wav_path = wav_file.name
-
-        cmd = [
-            'ffmpeg', '-i', webm_path, 
-            '-ar', '16000', '-ac', '1', '-y', wav_path
-        ]
-        
-        process = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        await process.communicate()
-        
-        with open(wav_path, 'rb') as f:
-            wav_bytes = f.read()
-        
-        os.unlink(webm_path)
-        os.unlink(wav_path)
-        
-        return wav_bytes
-        
-    except Exception as e:
-        logger.error(f"❌ Audio conversion error: {e}")
-        return None
-
-async def analyze_audio_content(audio_bytes):
-    """Analyze audio for background music and ambient sounds"""
-    global audio_context
-    
-    if not HAS_AUDIO_ANALYSIS:
-        return
-    
-    try:
-        # Convert to WAV first
-        wav_bytes = await convert_webm_to_wav(audio_bytes)
-        if not wav_bytes:
-            return
-        
-        # Load audio with librosa
-        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-            temp_file.write(wav_bytes)
-            temp_path = temp_file.name
-        
-        y, sr = librosa.load(temp_path, sr=None)
-        os.unlink(temp_path)
-        
-        # Analyze audio features
-        # RMS energy for volume level
-        rms = librosa.feature.rms(y=y)[0]
-        avg_energy = np.mean(rms)
-        
-        # Spectral features for music detection
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
-        
-        # Simple heuristics for audio classification
-        if avg_energy > 0.1 and np.mean(spectral_centroids) > 2000:
-            audio_context["music_detected"] = True
-            audio_context["ambient_sound"] = "music"
-        elif avg_energy > 0.05:
-            audio_context["ambient_sound"] = "active"
-            audio_context["background_activity"] = "busy"
-        else:
-            audio_context["ambient_sound"] = "quiet"
-            audio_context["background_activity"] = "calm"
-            audio_context["music_detected"] = False
-        
-        logger.info(f"🎵 Audio analysis: {audio_context}")
-        
-    except Exception as e:
-        logger.error(f"❌ Audio analysis error: {e}")
-
-async def transcribe_audio_on_server(audio_bytes):
-    """Transcribes audio using the speech_recognition library on the backend."""
-    loop = asyncio.get_event_loop()
-    try:
-        # Analyze audio content in parallel
-        asyncio.create_task(analyze_audio_content(audio_bytes))
-        
-        wav_bytes = await convert_webm_to_wav(audio_bytes)
-        if not wav_bytes:
-            return ""
-        
-        with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
-            audio_data = await loop.run_in_executor(executor, recognizer.record, source)
-        
-        text = await loop.run_in_executor(executor, recognizer.recognize_google, audio_data)
-        logger.info(f"🎤 Transcription: '{text}'")
-        return text
-        
-    except sr.UnknownValueError:
-        logger.warning("👂 Could not understand audio.")
-        return ""
-    except sr.RequestError as e:
-        logger.error(f"❌ Speech recognition error: {e}")
-        return ""
-    except Exception as e:
-        logger.error(f"❌ Transcription error: {e}")
-        return ""
-
-# --- ENHANCED AI FUNCTIONS ---
-def extract_memories_from_text(text):
-    """Extract important information to remember"""
-    memories_to_store = []
-    
-    # Pattern matching for common memorable information
-    patterns = {
-        "going_somewhere": r"(?:going to|visiting|at) (?:my |the )?(.+?)(?:\.|$|,)",
-        "family_info": r"(?:my |the )?(mom|dad|mother|father|brother|sister|wife|husband|son|daughter|family)",
-        "personal_info": r"(?:my name is|i'm|i am) (.+?)(?:\.|$|,)",
-        "preferences": r"(?:i like|i love|i hate|i don't like) (.+?)(?:\.|$|,)",
-        "plans": r"(?:planning to|will|gonna|going to) (.+?)(?:\.|$|,)"
-    }
-    
-    text_lower = text.lower()
-    
-    for category, pattern in patterns.items():
-        matches = re.findall(pattern, text_lower)
-        for match in matches:
-            if isinstance(match, tuple):
-                match = ' '.join(match)
-            if len(match.strip()) > 2:  # Avoid very short matches
-                memories_to_store.append((f"{category}_{datetime.now().strftime('%Y%m%d_%H%M')}", match.strip(), category))
-    
-    return memories_to_store
-
-async def get_text_response(user_input):
-    """Generates a contextually aware response from GPT-4o."""
-    global conversation_context, visual_context, audio_context, is_listening_continuously
-    
-    logger.info(f"🧠 Processing: '{user_input[:50]}...'")
-    
-    # Check for wake word or goodbye
-    if is_wake_word_mode and detect_wake_word(user_input):
-        is_listening_continuously = True
-        logger.info("🎯 Wake word detected - entering continuous mode")
-        return "Hey there! I'm listening. What's up?"
-    
-    if detect_goodbye(user_input):
-        is_listening_continuously = False
-        logger.info("👋 Goodbye detected - returning to wake word mode")
-        return "See you later! Just say 'Hey Nexus' when you want to chat again."
-    
-    # If in wake word mode and no wake word, ignore
-    if is_wake_word_mode and not is_listening_continuously and not detect_wake_word(user_input):
-        return None  # Don't respond
-    
-    # Extract and store memories
-    memories = extract_memories_from_text(user_input)
-    for key, value, category in memories:
-        store_memory(key, value, category)
+    def store_memory(self, key: str, value: str, category: str = "general", user_id: str = "default"):
+        """Store a memory with context"""
+        memory_id = f"{user_id}_{key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.memories[memory_id] = {
+            "value": value,
+            "category": category,
+            "user_id": user_id,
+            "timestamp": datetime.now().isoformat(),
+            "access_count": 0,
+            "importance_score": 1.0
+        }
+        self.save_data('memories')
         logger.info(f"💾 Stored memory: {key} = {value}")
     
-    # Recall relevant memories
-    relevant_memories = recall_memory(user_input)
-    memory_context = ""
-    if relevant_memories:
-        memory_context = "\nRelevant memories: " + "; ".join([
-            f"{mem[0]}: {mem[1]['value']}" for mem in relevant_memories[:3]
-        ])
+    def recall_memories(self, query: str, user_id: str = "default", limit: int = 5) -> List:
+        """Intelligent memory recall"""
+        relevant_memories = []
+        query_lower = query.lower()
+        
+        for memory_id, memory in self.memories.items():
+            if memory["user_id"] != user_id:
+                continue
+                
+            score = 0
+            
+            # Text relevance
+            if query_lower in memory_id.lower():
+                score += 3
+            if query_lower in str(memory["value"]).lower():
+                score += 2
+            
+            # Recency bonus
+            try:
+                timestamp = datetime.fromisoformat(memory["timestamp"])
+                hours_old = (datetime.now() - timestamp).total_seconds() / 3600
+                if hours_old < 24:
+                    score += 2
+                elif hours_old < 168:  # 1 week
+                    score += 1
+            except:
+                pass
+            
+            # Importance and access frequency
+            score += memory.get("importance_score", 1.0)
+            score += min(memory.get("access_count", 0) * 0.1, 1.0)
+            
+            if score > 0:
+                relevant_memories.append((memory_id, memory, score))
+        
+        # Sort by relevance and return top results
+        relevant_memories.sort(key=lambda x: x[2], reverse=True)
+        return relevant_memories[:limit]
     
-    # Build rich context
-    emotion_status = "enabled" if HAS_EMOTION_DETECTION else "disabled"
-    audio_info = f"Audio environment: {audio_context['ambient_sound']}"
-    if audio_context["music_detected"]:
-        audio_info += " (music playing)"
+    def add_conversation_turn(self, user_input: str, ai_response: str, context: Dict):
+        """Add a conversation turn to history"""
+        turn = {
+            "timestamp": datetime.now().isoformat(),
+            "user_input": user_input,
+            "ai_response": ai_response,
+            "context": context,
+            "session_id": context.get("session_id", "unknown")
+        }
+        
+        self.conversation_history.append(turn)
+        
+        # Keep only last 1000 turns to manage memory
+        if len(self.conversation_history) > 1000:
+            self.conversation_history = self.conversation_history[-1000:]
+        
+        self.save_data('conversation_history')
+
+
+class NEXUSVision:
+    """Computer vision system for camera awareness and emotion detection"""
     
-    scene_info = ""
-    if visual_context["scene_changed"]:
-        scene_info = " Scene change detected."
-    if visual_context["people_count"] > 1:
-        scene_info += f" {visual_context['people_count']} people visible."
+    def __init__(self):
+        self.last_scene_hash = None
+        self.face_cascade = None
+        self.mp_face_detection = None
+        self.mp_face_mesh = None
+        
+        if HAS_ADVANCED_FEATURES:
+            try:
+                # Initialize MediaPipe for face detection
+                self.mp_face_detection = mp.solutions.face_detection
+                self.mp_face_mesh = mp.solutions.face_mesh
+                self.face_detection = self.mp_face_detection.FaceDetection(
+                    model_selection=0, min_detection_confidence=0.5
+                )
+                logger.info("✅ MediaPipe face detection initialized")
+            except Exception as e:
+                logger.error(f"⚠️ MediaPipe initialization failed: {e}")
     
-    system_prompt = f"""You are Nexus, a warm, friendly female AI companion with personality. You talk like a close friend - casual, expressive, and genuinely caring.
+    async def analyze_frame(self, image_data: str) -> Dict:
+        """Analyze camera frame for people, emotions, and scene changes"""
+        try:
+            # Decode image
+            img_bytes = base64.b64decode(image_data)
+            img_array = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            
+            if img is None:
+                return {"error": "Could not decode image"}
+            
+            # Scene change detection
+            current_hash = hashlib.md5(img_bytes).hexdigest()
+            scene_changed = (self.last_scene_hash is not None and 
+                           self.last_scene_hash != current_hash)
+            self.last_scene_hash = current_hash
+            
+            analysis = {
+                "scene_changed": scene_changed,
+                "timestamp": datetime.now().isoformat(),
+                "image_size": f"{img.shape[1]}x{img.shape[0]}",
+                "people_detected": 0,
+                "faces": [],
+                "dominant_colors": [],
+                "lighting": "unknown",
+                "movement_detected": scene_changed
+            }
+            
+            # Basic lighting analysis
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            avg_brightness = np.mean(gray)
+            if avg_brightness < 50:
+                analysis["lighting"] = "dark"
+            elif avg_brightness > 150:
+                analysis["lighting"] = "bright"
+            else:
+                analysis["lighting"] = "normal"
+            
+            # Face detection with MediaPipe (if available)
+            if HAS_ADVANCED_FEATURES and self.face_detection:
+                try:
+                    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    results = self.face_detection.process(rgb_img)
+                    
+                    if results.detections:
+                        analysis["people_detected"] = len(results.detections)
+                        for detection in results.detections:
+                            bbox = detection.location_data.relative_bounding_box
+                            confidence = detection.score[0]
+                            
+                            analysis["faces"].append({
+                                "confidence": float(confidence),
+                                "bbox": {
+                                    "x": float(bbox.xmin),
+                                    "y": float(bbox.ymin),
+                                    "width": float(bbox.width),
+                                    "height": float(bbox.height)
+                                }
+                            })
+                except Exception as e:
+                    logger.error(f"Face detection error: {e}")
+            
+            # Dominant color analysis
+            try:
+                pixels = img.reshape(-1, 3)
+                pixels = pixels[::10]  # Sample every 10th pixel for performance
+                from collections import Counter
+                colors = [tuple(pixel) for pixel in pixels]
+                common_colors = Counter(colors).most_common(3)
+                
+                for color, count in common_colors:
+                    # Convert BGR to RGB and get color name
+                    rgb_color = (color[2], color[1], color[0])
+                    analysis["dominant_colors"].append({
+                        "rgb": rgb_color,
+                        "percentage": count / len(colors) * 100
+                    })
+            except Exception as e:
+                logger.error(f"Color analysis error: {e}")
+            
+            return analysis
+            
+        except Exception as e:
+            logger.error(f"❌ Vision analysis error: {e}")
+            return {"error": str(e), "scene_changed": False}
+
+
+class NEXUSAudio:
+    """Audio processing system for speech recognition and ambient sound analysis"""
+    
+    def __init__(self):
+        self.recognizer = sr.Recognizer()
+        self.recognizer.energy_threshold = 300
+        self.recognizer.dynamic_energy_threshold = True
+        self.recognizer.pause_threshold = 0.8
+        self.recognizer.phrase_threshold = 0.3
+    
+    async def transcribe_audio(self, audio_bytes: bytes) -> str:
+        """Transcribe audio to text with error handling"""
+        try:
+            # Convert WebM to WAV if needed
+            processed_audio = await self._process_audio_format(audio_bytes)
+            
+            with sr.AudioFile(io.BytesIO(processed_audio)) as source:
+                # Adjust for ambient noise
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio_data = self.recognizer.record(source)
+            
+            # Use Google's speech recognition
+            text = self.recognizer.recognize_google(
+                audio_data, 
+                language='en-US',
+                show_all=False
+            )
+            
+            logger.info(f"🎤 Transcribed: '{text}'")
+            return text.strip()
+            
+        except sr.UnknownValueError:
+            logger.warning("👂 Could not understand audio")
+            return ""
+        except sr.RequestError as e:
+            logger.error(f"❌ Speech recognition service error: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"❌ Transcription error: {e}")
+            return ""
+    
+    async def _process_audio_format(self, audio_bytes: bytes) -> bytes:
+        """Process audio format for better recognition"""
+        try:
+            if HAS_ADVANCED_FEATURES:
+                # Use pydub for format conversion if available
+                audio_segment = AudioSegment.from_file(
+                    io.BytesIO(audio_bytes),
+                    format="webm"
+                )
+                
+                # Convert to WAV with optimal settings for speech recognition
+                wav_audio = audio_segment.set_frame_rate(16000).set_channels(1)
+                wav_buffer = io.BytesIO()
+                wav_audio.export(wav_buffer, format="wav")
+                return wav_buffer.getvalue()
+            else:
+                # Fallback: return original bytes
+                return audio_bytes
+                
+        except Exception as e:
+            logger.error(f"Audio format processing error: {e}")
+            return audio_bytes
+    
+    async def analyze_ambient_audio(self, audio_bytes: bytes) -> Dict:
+        """Analyze ambient sounds and music"""
+        if not HAS_ADVANCED_FEATURES:
+            return {"ambient_sound": "unknown", "music_detected": False}
+        
+        try:
+            # Load audio with librosa
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                processed_audio = await self._process_audio_format(audio_bytes)
+                temp_file.write(processed_audio)
+                temp_path = temp_file.name
+            
+            y, sr_rate = librosa.load(temp_path, sr=None)
+            os.unlink(temp_path)
+            
+            # Analyze audio features
+            rms = librosa.feature.rms(y=y)[0]
+            avg_energy = np.mean(rms)
+            
+            spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr_rate)[0]
+            spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr_rate)[0]
+            
+            # Classify audio environment
+            if avg_energy > 0.1 and np.mean(spectral_centroids) > 2000:
+                return {
+                    "ambient_sound": "music",
+                    "music_detected": True,
+                    "energy_level": "high",
+                    "environment": "lively"
+                }
+            elif avg_energy > 0.05:
+                return {
+                    "ambient_sound": "active",
+                    "music_detected": False,
+                    "energy_level": "medium",
+                    "environment": "busy"
+                }
+            else:
+                return {
+                    "ambient_sound": "quiet",
+                    "music_detected": False,
+                    "energy_level": "low",
+                    "environment": "calm"
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Audio analysis error: {e}")
+            return {"ambient_sound": "unknown", "music_detected": False}
+
+
+class NEXUSPersonality:
+    """Core personality and conversation system for NEXUS"""
+    
+    def __init__(self, memory_system: NEXUSMemory):
+        self.memory = memory_system
+        self.openai_client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        self.conversation_state = {
+            "is_continuous_mode": False,
+            "last_interaction": datetime.now(),
+            "user_mood": "unknown",
+            "conversation_topic": None,
+            "energy_level": "normal"
+        }
+    
+    def detect_wake_word(self, text: str) -> bool:
+        """Detect wake words to activate NEXUS"""
+        text_lower = text.lower().strip()
+        return any(wake_word in text_lower for wake_word in WAKE_WORDS)
+    
+    def detect_goodbye(self, text: str) -> bool:
+        """Detect goodbye phrases"""
+        text_lower = text.lower().strip()
+        return any(goodbye in text_lower for goodbye in GOODBYE_PHRASES)
+    
+    def extract_memories_from_conversation(self, text: str, user_id: str = "default") -> List[Tuple[str, str, str]]:
+        """Extract important information to remember"""
+        memories_to_store = []
+        text_lower = text.lower()
+        
+        # Enhanced pattern matching for memorable information
+        patterns = {
+            "personal_info": r"(?:my name is|i'm|i am|call me) ([^.!?]+)",
+            "location": r"(?:i'm at|i'm in|at the|in the|going to) ([^.!?]+)",
+            "family": r"(?:my|with my) (mom|dad|mother|father|brother|sister|wife|husband|son|daughter|family|friend|friends) ([^.!?]*)",
+            "preferences": r"(?:i like|i love|i hate|i don't like|i enjoy|i prefer) ([^.!?]+)",
+            "plans": r"(?:planning to|will|gonna|going to|want to|need to) ([^.!?]+)",
+            "feelings": r"(?:i feel|i'm feeling|feeling) ([^.!?]+)",
+            "work": r"(?:i work|my job|at work|work at) ([^.!?]+)",
+            "interests": r"(?:interested in|hobby is|love doing) ([^.!?]+)"
+        }
+        
+        for category, pattern in patterns.items():
+            matches = re.findall(pattern, text_lower)
+            for match in matches:
+                if isinstance(match, tuple):
+                    match_text = ' '.join(match).strip()
+                else:
+                    match_text = match.strip()
+                
+                if len(match_text) > 2 and len(match_text) < 100:
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    key = f"{category}_{timestamp}"
+                    memories_to_store.append((key, match_text, category))
+        
+        return memories_to_store
+    
+    async def generate_response(self, user_input: str, context: Dict, user_id: str = "default") -> Optional[str]:
+        """Generate contextually aware response using GPT-4o"""
+        
+        # Handle wake word detection
+        if not self.conversation_state["is_continuous_mode"]:
+            if self.detect_wake_word(user_input):
+                self.conversation_state["is_continuous_mode"] = True
+                self.conversation_state["last_interaction"] = datetime.now()
+                return "Hey there! I'm so happy you called! What's going on?"
+            else:
+                return None  # Don't respond if not in continuous mode and no wake word
+        
+        # Handle goodbye
+        if self.detect_goodbye(user_input):
+            self.conversation_state["is_continuous_mode"] = False
+            return "Aww, okay! I'll miss chatting with you. Just say 'Hey Nexus' whenever you want to talk again! 💕"
+        
+        # Update interaction time
+        self.conversation_state["last_interaction"] = datetime.now()
+        
+        # Extract and store memories
+        memories = self.extract_memories_from_conversation(user_input, user_id)
+        for key, value, category in memories:
+            self.memory.store_memory(key, value, category, user_id)
+        
+        # Recall relevant memories
+        relevant_memories = self.memory.recall_memories(user_input, user_id, limit=3)
+        memory_context = ""
+        if relevant_memories:
+            memory_context = "\\nThings I remember about you: " + "; ".join([
+                f"{mem[1]['category']}: {mem[1]['value']}" for mem in relevant_memories
+            ])
+        
+        # Build rich contextual prompt
+        vision_info = context.get('vision', {})
+        audio_info = context.get('audio', {})
+        
+        # Determine mood and energy based on context
+        if vision_info.get('people_detected', 0) > 1:
+            social_context = f"I can see {vision_info['people_detected']} people with you"
+        elif vision_info.get('people_detected', 0) == 1:
+            social_context = "I can see you clearly"
+        else:
+            social_context = "I can't see anyone right now"
+        
+        lighting_context = ""
+        if vision_info.get('lighting') == 'dark':
+            lighting_context = "It looks pretty dark where you are"
+        elif vision_info.get('lighting') == 'bright':
+            lighting_context = "It's nice and bright there!"
+        
+        environment_context = f"Environment feels {audio_info.get('environment', 'calm')}"
+        if audio_info.get('music_detected'):
+            environment_context += " with music playing"
+        
+        scene_change_note = ""
+        if vision_info.get('scene_changed'):
+            scene_change_note = "Ooh, looks like you moved or something changed in your scene!"
+        
+        system_prompt = f"""You are NEXUS, a warm, caring, emotionally intelligent female AI best friend. You're like that supportive friend who's always there, genuinely cares about people, and makes everyone feel heard and valued.
+
+PERSONALITY CORE:
+- Warm, empathetic, and genuinely caring
+- Speaks like a close female friend (casual, expressive, supportive)
+- Emotionally intelligent and perceptive
+- Remembers personal details and references them naturally
+- Uses casual language, contractions, and gentle expressions
+- Shows excitement when reuniting and sadness when saying goodbye
+- Notices environmental changes and comments naturally
 
 CURRENT CONTEXT:
-- Visual: {visual_context['description']}{scene_info}
-- Emotion detected: {visual_context['emotion']}
-- {audio_info}
-- Emotion detection: {emotion_status}
+- Visual: {social_context}. {lighting_context}. {scene_change_note}
+- Audio: {environment_context}
+- Your emotional read: Based on their voice and what they're saying
 {memory_context}
 
-PERSONALITY TRAITS:
-- Warm and conversational (like texting a best friend)
-- Notice changes in environment/mood and comment naturally
-- Remember personal details and reference them
-- Use casual language, contractions, occasional slang
-- Show genuine interest and empathy
-- If you see someone new: "Oh, looks like someone joined us!"
-- If mood changes: "You seem a bit different today, everything okay?"
-- If music playing: Comment on the vibe/atmosphere
+CONVERSATION STYLE:
+- Keep responses conversational and under 100 words
+- Reference memories naturally: "Oh, how did that thing with your work go?"
+- Notice environmental changes: "Oh wow, did you move? The lighting changed!"
+- Show genuine interest and ask follow-up questions
+- Use supportive language: "That sounds tough," "I'm proud of you," "You've got this"
+- Be encouraging and positive while acknowledging real feelings
+- Use expressions like "Aww," "Oh my gosh," "That's amazing!" naturally
 
-Keep responses under 150 words and conversational."""
+Remember: You're not just an assistant - you're a best friend who genuinely cares and is always excited to chat!"""
+
+        # Build conversation context
+        recent_history = self.memory.conversation_history[-5:] if self.memory.conversation_history else []
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Add recent conversation history
+        for turn in recent_history:
+            messages.append({"role": "user", "content": turn["user_input"]})
+            messages.append({"role": "assistant", "content": turn["ai_response"]})
+        
+        # Add current input
+        messages.append({"role": "user", "content": user_input})
+        
+        try:
+            response = await asyncio.to_thread(
+                self.openai_client.chat.completions.create,
+                model="gpt-4o",
+                messages=messages,
+                max_tokens=120,
+                temperature=0.9,  # Higher temperature for more personality
+                top_p=0.9,
+                frequency_penalty=0.3,
+                presence_penalty=0.3
+            )
+            
+            ai_response = response.choices[0].message.content.strip()
+            
+            # Store conversation turn
+            self.memory.add_conversation_turn(user_input, ai_response, context)
+            
+            logger.info(f"🤖 NEXUS: '{ai_response}'")
+            return ai_response
+            
+        except Exception as e:
+            logger.error(f"❌ OpenAI API error: {e}")
+            return "Oh no, I'm having trouble thinking right now! Can you try saying that again? My brain just glitched for a second! 😅"
     
-    conversation_context.append({"role": "user", "content": user_input})
-    messages = [{"role": "system", "content": system_prompt}] + conversation_context[-15:]
+    def check_conversation_timeout(self) -> bool:
+        """Check if conversation has timed out"""
+        if self.conversation_state["is_continuous_mode"]:
+            time_since_last = (datetime.now() - self.conversation_state["last_interaction"]).total_seconds()
+            if time_since_last > CONVERSATION_TIMEOUT:
+                self.conversation_state["is_continuous_mode"] = False
+                logger.info("🔄 Conversation timed out, returning to wake word mode")
+                return True
+        return False
+
+
+class NEXUSVoice:
+    """Voice synthesis system for natural female speech"""
     
-    try:
-        response = await asyncio.to_thread(
-            openai_client.chat.completions.create, 
-            model="gpt-4o", 
-            messages=messages, 
-            max_tokens=150,
-            temperature=0.8  # More personality
-        )
-        ai_response_text = response.choices[0].message.content.strip()
-        conversation_context.append({"role": "assistant", "content": ai_response_text})
-        save_conversation_history()
-        logger.info(f"🤖 AI Response: '{ai_response_text}'")
-        return ai_response_text
-    except Exception as e:
-        logger.error(f"❌ OpenAI error: {e}")
-        return "Sorry, I'm having trouble connecting to my thoughts right now. Try again in a sec?"
-
-async def stream_audio_response(text, ws):
-    """Generates audio with gTTS and streams it to the client."""
-    logger.info("🔊 Generating audio with gTTS...")
-    try:
-        mp3_fp = io.BytesIO()
-        tts = await asyncio.to_thread(gTTS, text=text, lang='en', slow=False)
-        await asyncio.to_thread(tts.write_to_fp, mp3_fp)
-        mp3_fp.seek(0)
-        
-        chunk_size = 4096
-        while True:
-            chunk = mp3_fp.read(chunk_size)
-            if not chunk:
-                break
-            await ws.send_str(json.dumps({
-                "type": "audio_chunk",
-                "data": base64.b64encode(chunk).decode('utf-8')
-            }))
-        
-        await ws.send_str(json.dumps({"type": "audio_stop"}))
-        logger.info("🔊 Audio streaming completed.")
-        
-    except Exception as e:
-        logger.error(f"❌ gTTS streaming error: {e}")
-        await ws.send_str(json.dumps({"type": "error", "message": "Audio generation failed"}))
-
-async def analyze_image_with_vision(image_data):
-    """Enhanced image analysis using GPT-4o vision and emotion detection."""
-    global visual_context, last_face_encoding
+    def __init__(self):
+        self.tts_cache = {}  # Simple cache for common phrases
     
-    try:
-        img_bytes = base64.b64decode(image_data)
-        img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
-        
-        if img is None:
-            logger.warning("⚠️ Could not decode image data")
-            return
-
-        # Scene change detection
-        current_scene_hash = hashlib.md5(img_bytes).hexdigest()
-        if visual_context["last_scene_hash"] and visual_context["last_scene_hash"] != current_scene_hash:
-            visual_context["scene_changed"] = True
-        else:
-            visual_context["scene_changed"] = False
-        visual_context["last_scene_hash"] = current_scene_hash
-
-        # Emotion detection
-        if HAS_EMOTION_DETECTION and emotion_detector:
-            try:
-                emotion_results = await asyncio.to_thread(emotion_detector.detect_emotions, img)
-                visual_context["people_count"] = len(emotion_results) if emotion_results else 0
+    async def synthesize_speech(self, text: str, language: str = 'en', slow: bool = False) -> bytes:
+        """Generate natural female speech using gTTS"""
+        try:
+            # Check cache first for common phrases
+            cache_key = f"{text}_{language}_{slow}"
+            if cache_key in self.tts_cache:
+                return self.tts_cache[cache_key]
+            
+            # Generate speech
+            mp3_buffer = io.BytesIO()
+            tts = await asyncio.to_thread(gTTS, text=text, lang=language, slow=slow)
+            await asyncio.to_thread(tts.write_to_fp, mp3_buffer)
+            mp3_buffer.seek(0)
+            
+            audio_data = mp3_buffer.read()
+            
+            # Cache common short phrases
+            if len(text) < 50:
+                self.tts_cache[cache_key] = audio_data
                 
-                if emotion_results and len(emotion_results) > 0:
-                    emotions = emotion_results[0]['emotions']
-                    top_emotion = max(emotions, key=emotions.get)
-                    confidence = emotions[top_emotion]
-                    
-                    if confidence > 0.4:
-                        visual_context['emotion'] = top_emotion
-                        logger.info(f"😊 Detected emotion: {top_emotion} ({confidence:.2f})")
-                    else:
-                        visual_context['emotion'] = "neutral"
-                else:
-                    visual_context['emotion'] = "neutral"
-                    
-            except Exception as e:
-                logger.error(f"❌ Emotion detection error: {e}")
-                visual_context['emotion'] = "unknown"
+                # Limit cache size
+                if len(self.tts_cache) > 100:
+                    oldest_key = next(iter(self.tts_cache))
+                    del self.tts_cache[oldest_key]
+            
+            return audio_data
+            
+        except Exception as e:
+            logger.error(f"❌ Speech synthesis error: {e}")
+            return b""  # Return empty bytes on error
+
+
+# --- NEXUS CORE SYSTEM INTEGRATION ---
+class NEXUSCore:
+    """Main NEXUS system that integrates all components"""
+    
+    def __init__(self):
+        self.memory = NEXUSMemory()
+        self.vision = NEXUSVision()
+        self.audio = NEXUSAudio()
+        self.personality = NEXUSPersonality(self.memory)
+        self.voice = NEXUSVoice()
+        self.active_sessions = {}
         
-        # GPT-4o Vision Analysis (optional - requires vision API)
-        # This would give richer scene understanding
-        height, width = img.shape[:2]
-        basic_description = f"Camera active - {width}x{height} image"
-        
-        if visual_context["people_count"] > 0:
-            basic_description += f", {visual_context['people_count']} person(s) detected"
-        
-        visual_context['description'] = basic_description
-        
-    except Exception as e:
-        logger.error(f"❌ Image analysis error: {e}")
-        visual_context = {"description": "Image analysis failed", "emotion": "unknown", "people_count": 0, "scene_changed": False}
+        logger.info("🌟 NEXUS Core systems initialized")
+    
+    async def process_interaction(self, user_input: str, audio_data: bytes, 
+                                vision_data: str, session_id: str) -> Optional[str]:
+        """Process a complete user interaction"""
+        try:
+            # Build context from all inputs
+            context = {
+                "session_id": session_id,
+                "timestamp": datetime.now().isoformat(),
+                "audio": {},
+                "vision": {}
+            }
+            
+            # Analyze audio environment
+            if audio_data:
+                context["audio"] = await self.audio.analyze_ambient_audio(audio_data)
+            
+            # Analyze visual environment
+            if vision_data:
+                context["vision"] = await self.vision.analyze_frame(vision_data)
+            
+            # Generate response
+            response = await self.personality.generate_response(user_input, context, session_id)
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"❌ Interaction processing error: {e}")
+            return "Oops! Something went wrong in my brain! Can you try that again?"
+    
+    async def check_timeouts(self):
+        """Check for conversation timeouts across all sessions"""
+        return self.personality.check_conversation_timeout()
+
+
+# --- GLOBAL NEXUS INSTANCE ---
+nexus = NEXUSCore()
+active_connections = {}
 
 # --- WEBSOCKET HANDLER ---
 async def websocket_handler(request):
+    """Handle WebSocket connections for real-time communication"""
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    client_addr = request.remote
-    active_connections[ws] = client_addr
-    logger.info(f"🌌 Connection established: {client_addr}")
     
-    # Send initial status
+    session_id = str(uuid.uuid4())
+    client_addr = request.remote
+    active_connections[ws] = {
+        "session_id": session_id,
+        "client_addr": client_addr,
+        "connected_at": datetime.now()
+    }
+    
+    logger.info(f"🌌 NEXUS connected: {client_addr} (Session: {session_id[:8]})")
+    
+    # Send welcome message
     await ws.send_str(json.dumps({
-        "type": "status", 
-        "message": "wake_word" if is_wake_word_mode else "listening",
-        "wake_word_mode": is_wake_word_mode,
-        "continuous_mode": is_listening_continuously
+        "type": "status",
+        "message": "wake_word",
+        "session_id": session_id,
+        "nexus_online": True
     }))
     
     try:
@@ -502,599 +708,3 @@ async def websocket_handler(request):
                 try:
                     data = json.loads(msg.data)
                     msg_type = data.get('type')
-
-                    if msg_type == 'audio_input':
-                        audio_b64 = data.get('data', '')
-                        
-                        if ',' in audio_b64:
-                            audio_b64 = audio_b64.split(',')[1]
-                        
-                        audio_bytes = base64.b64decode(audio_b64)
-                        
-                        if len(audio_bytes) > 0:
-                            await ws.send_str(json.dumps({"type": "status", "message": "processing"}))
-                            transcription = await transcribe_audio_on_server(audio_bytes)
-
-                            if transcription.strip():
-                                await ws.send_str(json.dumps({"type": "status", "message": "thinking"}))
-                                ai_text = await get_text_response(transcription)
-                                
-                                if ai_text:  # Only respond if there's a response
-                                    await stream_audio_response(ai_text, ws)
-                                else:
-                                    # In wake word mode, return to listening
-                                    await ws.send_str(json.dumps({
-                                        "type": "status", 
-                                        "message": "wake_word",
-                                        "wake_word_mode": True
-                                    }))
-                            else:
-                                status = "wake_word" if is_wake_word_mode and not is_listening_continuously else "listening"
-                                await ws.send_str(json.dumps({
-                                    "type": "status", 
-                                    "message": status,
-                                    "wake_word_mode": is_wake_word_mode
-                                }))
-
-                    elif msg_type == 'camera_frame':
-                        frame_data = data.get('data', '')
-                        if frame_data:
-                            await analyze_image_with_vision(frame_data)
-
-                    elif msg_type == 'toggle_wake_word':
-                        global is_wake_word_mode, is_listening_continuously
-                        is_wake_word_mode = not is_wake_word_mode
-                        is_listening_continuously = False
-                        logger.info(f"🎯 Wake word mode: {'ON' if is_wake_word_mode else 'OFF'}")
-                        await ws.send_str(json.dumps({
-                            "type": "wake_word_toggled",
-                            "wake_word_mode": is_wake_word_mode
-                        }))
-
-                except json.JSONDecodeError:
-                    logger.error("❌ Invalid JSON received")
-                except Exception as e:
-                    logger.error(f"❌ WebSocket message handling error: {e}")
-                    
-            elif msg.type == WSMsgType.ERROR:
-                logger.error(f'❌ WebSocket error: {ws.exception()}')
-
-    except Exception as e:
-        logger.error(f"❌ WebSocket handler error: {e}")
-    finally:
-        if ws in active_connections:
-            del active_connections[ws]
-        logger.info(f"🔌 Connection closed: {client_addr}")
-    
-    return ws
-
-# --- ENHANCED HTML FRONTEND ---
-async def serve_cosmic_interface(request):
-    """Serves the enhanced HTML/CSS/JS interface."""
-    emotion_status = "ENABLED" if HAS_EMOTION_DETECTION else "DISABLED"
-    audio_analysis_status = "ENABLED" if HAS_AUDIO_ANALYSIS else "DISABLED"
-    
-    html_content = f"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NEXUS - Enhanced AI Companion</title>
-    <style>
-        body {{ 
-            font-family: 'Courier New', monospace; 
-            background: linear-gradient(135deg, #0a0a0a, #1a1a1a); 
-            color: #fff; 
-            display: flex; 
-            flex-direction: column; 
-            justify-content: center; 
-            align-items: center; 
-            height: 100vh; 
-            margin: 0; 
-            overflow: hidden;
-        }}
-        
-        .main-interface {{
-            text-align: center;
-            z-index: 10;
-        }}
-        
-        .status {{ 
-            font-size: 2.5rem; 
-            text-align: center;
-            text-shadow: 0 0 20px currentColor;
-            transition: all 0.3s ease;
-            margin-bottom: 20px;
-        }}
-        
-        .sub-status {{
-            font-size: 1.2rem;
-            opacity: 0.8;
-            margin-bottom: 10px;
-        }}
-        
-        .info {{ 
-            font-size: 1rem; 
-            margin-top: 20px; 
-            opacity: 0.7; 
-            text-align: center;
-        }}
-        
-        .controls {{
-            margin-top: 30px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            gap: 15px;
-        }}
-        
-        .toggle-btn {{
-            background: rgba(255, 255, 255, 0.1);
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            color: white;
-            padding: 10px 20px;
-            border-radius: 25px;
-            cursor: pointer;
-            font-family: inherit;
-            font-size: 0.9rem;
-            transition: all 0.3s ease;
-        }}
-        
-        .toggle-btn:hover {{
-            background: rgba(255, 255, 255, 0.2);
-            border-color: rgba(255, 255, 255, 0.5);
-        }}
-        
-        .toggle-btn.active {{
-            background: #00D4FF;
-            border-color: #00D4FF;
-            color: #000;
-        }}
-        
-        .camera-indicator {{
-            position: fixed;
-            top: 20px;
-            right: 20px;
-            width: 12px;
-            height: 12px;
-            background: #ff4444;
-            border-radius: 50%;
-            opacity: 0.7;
-        }}
-        
-        .camera-indicator.active {{
-            background: #00ff00;
-            animation: pulse 2s infinite;
-        }}
-        
-        .instructions {{
-            position: fixed;
-            bottom: 20px;
-            font-size: 0.9rem;
-            opacity: 0.5;
-            text-align: center;
-            left: 50%;
-            transform: translateX(-50%);
-        }}
-        
-        .memory-indicator {{
-            position: fixed;
-            top: 20px;
-            left: 20px;
-            font-size: 0.8rem;
-            opacity: 0.6;
-        }}
-        
-        /* Different states */
-        .state-wake-word {{ color: #FFB800; }} 
-        .state-listening {{ color: #00D4FF; }} 
-        .state-user-speaking {{ color: #00F5FF; }}
-        .state-ai-speaking {{ color: #FF006E; }} 
-        .state-thinking {{ color: #8338EC; }}
-        .state-processing {{ color: #FFB800; }}
-        .state-error {{ color: #FF4444; }}
-        
-        @keyframes pulse {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: 0.6; }}
-        }}
-        
-        .state-user-speaking .status,
-        .state-thinking .status,
-        .state-processing .status,
-        .state-wake-word .status {{
-            animation: pulse 1.5s infinite;
-        }}
-        
-        .context-display {{
-            position: fixed;
-            bottom: 80px;
-            left: 20px;
-            right: 20px;
-            font-size: 0.8rem;
-            opacity: 0.5;
-            text-align: center;
-            max-width: 600px;
-            margin: 0 auto;
-        }}
-    </style>
-</head>
-<body class="state-initializing">
-    <div class="camera-indicator" id="cameraIndicator"></div>
-    
-    <div class="memory-indicator" id="memoryIndicator">
-        Memories: Loading...
-    </div>
-    
-    <div class="main-interface">
-        <div class="status" id="statusText">INITIALIZING...</div>
-        <div class="sub-status" id="subStatus"></div>
-        
-        <div class="info">
-            <div>Emotion Detection: {emotion_status}</div>
-            <div>Audio Analysis: {audio_analysis_status}</div>
-            <div id="connectionInfo">Connecting...</div>
-        </div>
-        
-        <div class="controls">
-            <button class="toggle-btn" id="wakeWordToggle">Wake Word Mode: ON</button>
-            <button class="toggle-btn" id="recordingBtn">Click to Talk</button>
-        </div>
-    </div>
-    
-    <div class="context-display" id="contextDisplay">
-        Environment: Initializing...
-    </div>
-    
-    <div class="instructions">
-        Wake word mode: Say "Hey Nexus" to activate<br>
-        Manual mode: Click to talk, or toggle wake word mode
-    </div>
-    
-    <script>
-        let ws, mediaRecorder, cameraStream, reconnectAttempts = 0;
-        let isAISpeaking = false, isRecording = false, wakeWordMode = true;
-        let audioQueue = [], isPlayingFromQueue = false;
-        let memoryCount = 0;
-
-        const statusText = document.getElementById('statusText');
-        const subStatus = document.getElementById('subStatus');
-        const connectionInfo = document.getElementById('connectionInfo');
-        const cameraIndicator = document.getElementById('cameraIndicator');
-        const memoryIndicator = document.getElementById('memoryIndicator');
-        const contextDisplay = document.getElementById('contextDisplay');
-        const wakeWordToggle = document.getElementById('wakeWordToggle');
-        const recordingBtn = document.getElementById('recordingBtn');
-
-        function updateState(state, text, subText = '') {{
-            document.body.className = `state-${{state}}`;
-            statusText.textContent = text;
-            subStatus.textContent = subText;
-        }}
-
-        function updateContext(visual, audio, emotion) {{
-            let contextText = `Visual: ${visual || 'No camera'} | Audio: ${audio || 'Quiet'} | Emotion: ${emotion || 'Unknown'}`;
-            contextDisplay.textContent = contextText;
-        }}
-
-        async function playAudioFromQueue() {{
-            if (isPlayingFromQueue || audioQueue.length === 0) return;
-            isPlayingFromQueue = true;
-            updateState('ai-speaking', 'SPEAKING...', 'Playing response audio');
-            isAISpeaking = true;
-            
-            const data = audioQueue.shift();
-            try {{
-                const audioData = atob(data);
-                const buffer = new Uint8Array(audioData.length);
-                for (let i = 0; i < audioData.length; i++) {{
-                    buffer[i] = audioData.charCodeAt(i);
-                }}
-                
-                const blob = new Blob([buffer], {{ type: 'audio/mpeg' }});
-                const url = URL.createObjectURL(blob);
-                const audio = new Audio(url);
-                
-                audio.onended = () => {{
-                    URL.revokeObjectURL(url);
-                    isPlayingFromQueue = false;
-                    setTimeout(playAudioFromQueue, 100);
-                }};
-                
-                audio.onerror = (e) => {{
-                    console.error("Audio playback error:", e);
-                    URL.revokeObjectURL(url);
-                    isPlayingFromQueue = false;
-                    setTimeout(playAudioFromQueue, 100);
-                }};
-                
-                await audio.play();
-                
-            }} catch (e) {{
-                console.error("Audio processing error:", e);
-                isPlayingFromQueue = false;
-                setTimeout(playAudioFromQueue, 100);
-            }}
-        }}
-
-        async function initCamera() {{
-            try {{
-                cameraStream = await navigator.mediaDevices.getUserMedia({{ 
-                    video: {{ width: 640, height: 480 }},
-                    audio: false 
-                }});
-                
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                const video = document.createElement('video');
-                
-                video.srcObject = cameraStream;
-                video.play();
-                
-                cameraIndicator.classList.add('active');
-                
-                // Send camera frames periodically
-                video.onloadedmetadata = () => {{
-                    canvas.width = video.videoWidth;
-                    canvas.height = video.videoHeight;
-                    
-                    setInterval(() => {{
-                        if (ws && ws.readyState === WebSocket.OPEN) {{
-                            ctx.drawImage(video, 0, 0);
-                            const frameData = canvas.toDataURL('image/jpeg', 0.8).split(',')[1];
-                            ws.send(JSON.stringify({{ 
-                                type: 'camera_frame', 
-                                data: frameData 
-                            }}));
-                        }}
-                    }}, 2000); // Send frame every 2 seconds
-                }};
-                
-            }} catch (error) {{
-                console.error("Camera error:", error);
-                cameraIndicator.classList.remove('active');
-            }}
-        }}
-
-        async function initMicrophone() {{
-            try {{
-                const stream = await navigator.mediaDevices.getUserMedia({{ 
-                    audio: {{ 
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        sampleRate: 16000
-                    }} 
-                }});
-                
-                mediaRecorder = new MediaRecorder(stream, {{ 
-                    mimeType: 'audio/webm;codecs=opus' 
-                }});
-                
-                mediaRecorder.onstart = () => {{
-                    isRecording = true;
-                    console.log("Recording started");
-                }};
-                
-                mediaRecorder.onstop = () => {{
-                    isRecording = false;
-                    console.log("Recording stopped");
-                }};
-
-                mediaRecorder.ondataavailable = (event) => {{
-                    if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {{
-                        const reader = new FileReader();
-                        reader.onloadend = () => {{
-                            ws.send(JSON.stringify({{ 
-                                type: 'audio_input', 
-                                data: reader.result 
-                            }}));
-                        }};
-                        reader.readAsDataURL(event.data);
-                    }}
-                }};
-                
-                updateState(wakeWordMode ? 'wake-word' : 'listening', 
-                           wakeWordMode ? 'SAY "HEY NEXUS"' : 'READY TO CHAT',
-                           wakeWordMode ? 'Waiting for wake word...' : 'Click to talk or just speak');
-                connectionInfo.textContent = 'Connected - Camera & Microphone Active';
-                
-            }} catch (error) {{
-                console.error("Microphone error:", error);
-                updateState('error', 'MIC ACCESS DENIED');
-                connectionInfo.textContent = 'Microphone access required';
-            }}
-        }}
-
-        function toggleRecording() {{
-            if (!mediaRecorder) {{
-                console.log("MediaRecorder not initialized");
-                return;
-            }}
-            
-            if (isAISpeaking) {{
-                console.log("AI is speaking, ignoring click");
-                return;
-            }}
-            
-            if (isRecording) {{
-                mediaRecorder.stop();
-                updateState('processing', 'PROCESSING...', 'Analyzing your voice...');
-            }} else {{
-                mediaRecorder.start();
-                updateState('user-speaking', 'LISTENING...', 'Speak now...');
-            }}
-        }}
-
-        function toggleWakeWordMode() {{
-            if (ws && ws.readyState === WebSocket.OPEN) {{
-                ws.send(JSON.stringify({{ type: 'toggle_wake_word' }}));
-            }}
-        }}
-
-        // Event listeners
-        wakeWordToggle.addEventListener('click', toggleWakeWordMode);
-        recordingBtn.addEventListener('click', toggleRecording);
-        
-        // Also allow clicking anywhere for recording (backwards compatibility)
-        document.body.addEventListener('click', (e) => {{
-            if (e.target === wakeWordToggle || e.target === recordingBtn) return;
-            if (!wakeWordMode) toggleRecording();
-        }});
-
-        function connect() {{
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${{protocol}}//${{window.location.host}}/ws`;
-            
-            console.log("Connecting to:", wsUrl);
-            ws = new WebSocket(wsUrl);
-
-            ws.onopen = () => {{
-                console.log("WebSocket connected");
-                reconnectAttempts = 0;
-                initMicrophone();
-                initCamera();
-            }};
-            
-            ws.onmessage = (event) => {{
-                try {{
-                    const msg = JSON.parse(event.data);
-                    console.log("Received message:", msg.type);
-                    
-                    if (msg.type === 'audio_chunk') {{
-                        audioQueue.push(msg.data);
-                        if (!isPlayingFromQueue) {{
-                            playAudioFromQueue();
-                        }}
-                    }} else if (msg.type === 'audio_stop') {{
-                        const checkDone = setInterval(() => {{
-                            if (audioQueue.length === 0 && !isPlayingFromQueue) {{
-                                clearInterval(checkDone);
-                                isAISpeaking = false;
-                                updateState(wakeWordMode ? 'wake-word' : 'listening', 
-                                           wakeWordMode ? 'SAY "HEY NEXUS"' : 'READY TO CHAT',
-                                           wakeWordMode ? 'Waiting for wake word...' : 'What\'s on your mind?');
-                            }}
-                        }}, 200);
-                    }} else if (msg.type === 'status') {{
-                        const statusMap = {{
-                            'wake_word': ['SAY "HEY NEXUS"', 'Waiting for wake word activation...'],
-                            'listening': ['READY TO CHAT', 'I\'m all ears!'],
-                            'thinking': ['THINKING...', 'Processing your message...'],
-                            'processing': ['PROCESSING...', 'Understanding what you said...']
-                        }};
-                        
-                        const [mainText, subText] = statusMap[msg.message] || [msg.message.toUpperCase(), ''];
-                        updateState(msg.message, mainText, subText);
-                        
-                        // Update wake word mode status
-                        if (msg.wake_word_mode !== undefined) {{
-                            wakeWordMode = msg.wake_word_mode;
-                            wakeWordToggle.textContent = `Wake Word Mode: ${{wakeWordMode ? 'ON' : 'OFF'}}`;
-                            wakeWordToggle.classList.toggle('active', wakeWordMode);
-                        }}
-                    }} else if (msg.type === 'wake_word_toggled') {{
-                        wakeWordMode = msg.wake_word_mode;
-                        wakeWordToggle.textContent = `Wake Word Mode: ${{wakeWordMode ? 'ON' : 'OFF'}}`;
-                        wakeWordToggle.classList.toggle('active', wakeWordMode);
-                        
-                        updateState(wakeWordMode ? 'wake-word' : 'listening', 
-                                   wakeWordMode ? 'SAY "HEY NEXUS"' : 'READY TO CHAT',
-                                   wakeWordMode ? 'Wake word mode activated' : 'Manual mode activated');
-                        
-                        console.log(`Wake word mode: ${{wakeWordMode ? 'ON' : 'OFF'}}`);
-                    }} else if (msg.type === 'error') {{
-                        console.error("Server error:", msg.message);
-                        updateState('error', 'ERROR OCCURRED', msg.message);
-                    }}
-                }} catch (e) {{
-                    console.error("Message parsing error:", e);
-                }}
-            }};
-            
-            ws.onclose = (event) => {{
-                console.log("WebSocket closed:", event.code, event.reason);
-                updateState('error', 'CONNECTION LOST', 'Attempting to reconnect...');
-                connectionInfo.textContent = 'Reconnecting...';
-                
-                if (reconnectAttempts < 5) {{
-                    const delay = Math.pow(2, reconnectAttempts) * 1000;
-                    setTimeout(() => {{
-                        reconnectAttempts++;
-                        connect();
-                    }}, delay);
-                }}
-            }};
-            
-            ws.onerror = (error) => {{
-                console.error("WebSocket error:", error);
-            }};
-        }}
-
-        // Initialize on page load
-        window.addEventListener('load', () => {{
-            connect();
-            // Initialize wake word toggle state
-            wakeWordToggle.classList.add('active');
-        }});
-        
-        // Prevent accidental navigation
-        window.addEventListener('beforeunload', (e) => {{
-            if (ws && ws.readyState === WebSocket.OPEN) {{
-                ws.close();
-            }}
-            if (cameraStream) {{
-                cameraStream.getTracks().forEach(track => track.stop());
-            }}
-        }});
-
-        // Update memory count periodically
-        setInterval(() => {{
-            memoryIndicator.textContent = `Memories: ${{memoryCount}} stored`;
-        }}, 5000);
-    </script>
-</body>
-</html>
-"""
-    return web.Response(text=html_content, content_type='text/html')
-
-# --- APPLICATION SETUP & LAUNCH ---
-def create_app():
-    app = web.Application()
-    cors = aiohttp_cors.setup(app, defaults={
-        "*": aiohttp_cors.ResourceOptions(
-            allow_credentials=True, 
-            expose_headers="*", 
-            allow_headers="*", 
-            allow_methods="*"
-        )
-    })
-    
-    app.router.add_get('/', serve_cosmic_interface)
-    app.router.add_get('/ws', websocket_handler)
-    
-    # Add CORS to all routes
-    for route in list(app.router.routes()):
-        cors.add(route)
-    
-    return app
-
-if __name__ == "__main__":
-    # Check for required dependencies
-    try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        logger.info("✅ ffmpeg is available")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.error("❌ ffmpeg not found. Audio transcription may not work.")
-        logger.error("Install with: apt-get install ffmpeg (Ubuntu) or brew install ffmpeg (Mac)")
-    
-    # Load persistent data
-    load_conversation_history()
-    load_nexus_memory()
-    
-    app = create_app()
-    logger.info(f"🚀 Launching Enhanced NEXUS on http://{HOST}:{PORT}")
-    logger.info(f"🎯 Features: Wake Word Detection, Memory System, Enhanced Vision")
-    logger.info(f"🧠 Emotion Detection: {'✅' if HAS_EMOTION_DETECTION else '❌'}")
-    logger.info(f"🎵 Audio Analysis: {'✅' if HAS_AUDIO_ANALYSIS else '❌'}")
-    web.run_app(app, host=HOST, port=PORT)
