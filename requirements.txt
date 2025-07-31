@@ -1,34 +1,25 @@
-# Core web framework for real-time communication
-aiohttp==3.9.1
+# Core web framework
+aiohttp==3.8.6
 aiohttp-cors==0.7.0
-websockets==12.0
 
-# OpenAI GPT-4o for intelligent conversation
-openai>=1.35.0
+# OpenAI API for GPT-4o
+openai==1.35.0
 
-# Configuration management
+# Configuration
 python-dotenv==1.0.0
 
-# Voice synthesis (female voice)
+# Text-to-speech (reliable and lightweight)
 gTTS==2.4.0
 
-# Speech recognition for wake words and conversation
-SpeechRecognition==3.10.1
+# Speech recognition
+SpeechRecognition==3.10.0
 
-# Computer vision for camera awareness (headless for servers)
+# Basic image processing (headless for server deployment)
 opencv-python-headless==4.8.1.78
-Pillow==10.1.0
-numpy==1.26.2
 
-# Audio processing for ambient sound detection
-librosa==0.10.1
-soundfile==0.12.1
+# Essential data processing
+numpy==1.24.4
+Pillow==10.0.1
 
-# Face detection and emotion recognition (lightweight)
-mediapipe==0.10.8
-
-# For better audio format handling
-pydub==0.25.1
-
-# HTTP client for external APIs
-httpx==0.25.2
+# WebSocket support
+websockets==11.0.3
