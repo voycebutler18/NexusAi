@@ -1,16 +1,25 @@
+# Core web framework
+aiohttp==3.9.1
+aiohttp-cors==0.7.0
+
+# OpenAI API
 openai>=1.0.0
-httpx
-python-dotenv
-aiohttp
-aiohttp-cors
-numpy
-Pillow
-fer
-tensorflow
-sounddevice
-wavio
-gTTS
-playsound
-opencv-python
-websockets
-python-multipart
+
+# Configuration
+python-dotenv==1.0.0
+
+# Audio processing (lightweight)
+gTTS==2.4.0
+SpeechRecognition==3.10.0
+
+# Image processing (headless version for servers)
+opencv-python-headless==4.8.1.78
+Pillow==10.1.0
+numpy==1.24.3
+
+# Basic audio analysis (optional)
+librosa==0.10.1
+soundfile==0.12.1
+
+# Web utilities
+websockets==12.0
