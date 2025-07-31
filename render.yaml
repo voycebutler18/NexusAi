@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: nexus-ai-companion
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.4
+    healthCheckPath: /
